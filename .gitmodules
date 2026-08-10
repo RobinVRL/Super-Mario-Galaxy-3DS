@@ -1,0 +1,6 @@
+[submodule "external/DolRecomp"]
+	path = external/DolRecomp
+	url = https://github.com/RobinVRL/DolRecomp-SMG3DS.git
+[submodule "external/ModernGekko"]
+	path = external/ModernGekko
+	url = https://github.com/ExpansionPak/ModernGekko.git
