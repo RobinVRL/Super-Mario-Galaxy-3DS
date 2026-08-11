@@ -22,11 +22,14 @@
 
 enum {
     SMG3DS_MEM2_SIZE = 64 * 1024 * 1024,
-    SMG3DS_MEM2_PAGE_SHIFT = 16,
+    SMG3DS_MEM2_PAGE_SHIFT = 12,
     SMG3DS_MEM2_PAGE_SIZE = 1 << SMG3DS_MEM2_PAGE_SHIFT,
     SMG3DS_MEM2_PAGE_COUNT = SMG3DS_MEM2_SIZE / SMG3DS_MEM2_PAGE_SIZE,
-    SMG3DS_DISPATCHES_PER_FRAME = 4096,
+    SMG3DS_MAX_DISPATCHES_PER_FRAME = 4096,
+    SMG3DS_CPU_SLICE_MILLISECONDS = 12,
+    SMG3DS_DEBUG_LOG_FRAMES = 30,
     SMG3DS_TIMEBASE_PER_FRAME = 1012500,
+    SMG3DS_TIMEBASE_FREQUENCY = 60750000,
     SMG3DS_BROADWAY_CYCLES_PER_TIMEBASE_TICK = 12,
     SMG3DS_INITIAL_STACK = 0x817fffc0,
     SMG3DS_WII_SETTINGS_ADDRESS = 0x80003800u,
@@ -41,7 +44,22 @@ static uint32_t g_last_mmio_value;
 static uint32_t g_last_mmio_size;
 static uint32_t g_gx_mmio_writes;
 static uint32_t g_dsp_status_reads;
+static uint32_t g_dsp_ready_mails;
+static uint32_t g_dsp_mail_reads;
 static uint32_t g_system_calls;
+static uint32_t g_cache_range_skips;
+static uint32_t g_case_compare_fast_paths;
+static uint32_t g_yaz0_fast_paths;
+static uint32_t g_yaz0_fast_bytes;
+static uint32_t g_kpad_reads;
+static uint32_t g_kpad_samples;
+static u32 g_host_keys_held;
+static u32 g_host_keys_latched_down;
+static circlePosition g_host_circle;
+static touchPosition g_host_touch;
+static bool g_host_touch_active;
+static u32 g_kpad_previous_hold;
+static bool g_kpad_shake_phase;
 static uint32_t g_debug_frames;
 static uint32_t g_fault_raw;
 static uint32_t g_fault_cia;
@@ -51,9 +69,15 @@ static uint32_t g_mem2_pages_used;
 static bool g_mem2_out_of_memory;
 static uint16_t g_dsp_control = 0x0804u;
 static uint16_t g_dsp_hardware_status;
+static uint16_t g_pe_interrupt_control;
 static uint8_t g_dsp_init_code_reads;
 static uint32_t g_dsp_from_mail;
-static bool g_dsp_boot_armed;
+static uint32_t g_dsp_next_mail;
+static uint32_t g_dsp_to_mail;
+static uint32_t g_dsp_ready_mail;
+static uint32_t g_dsp_boot_command;
+static uint32_t g_dsp_packet_words;
+static uint32_t g_dsp_packet_tag;
 static uint32_t g_ipc_ppc_msg;
 static uint32_t g_ipc_arm_msg;
 static uint32_t g_ipc_control;
@@ -65,22 +89,30 @@ static bool g_pi_external_pending;
 static uint32_t g_pi_cause;
 static uint32_t g_pi_mask;
 static uint32_t g_vi_retraces;
+static bool g_vi_demand_pacing;
 static uint32_t g_external_interrupts;
 static uint32_t g_decrementer_interrupts;
 static bool g_decrementer_armed;
 static bool g_decrementer_pending;
 static uint32_t g_timebase_cycle_remainder;
+static uint32_t g_ai_control;
+static uint32_t g_ai_sample_count;
+static u64 g_ai_sample_timebase;
 static FILE* g_debug_file = NULL;
 
 enum {
     SMG3DS_IPC_IRQ = 0x40000000u,
     SMG3DS_PI_EXI = 0x00000010u,
+    SMG3DS_PI_DSP = 0x00000040u,
     SMG3DS_PI_VI = 0x00000100u,
+    SMG3DS_PI_PE_TOKEN = 0x00000200u,
+    SMG3DS_PI_PE_FINISH = 0x00000400u,
     SMG3DS_PI_WII_IPC = 0x00004000u,
     SMG3DS_VI_DI0_LOW = 0x0c002030u,
     SMG3DS_VI_DI1_LOW = 0x0c002034u,
     SMG3DS_VI_DI_ENABLE = 0x1000u,
     SMG3DS_VI_DI_PENDING = 0x8000u,
+    SMG3DS_PE_INTERRUPT_CONTROL = 0x0c00100au,
     SMG3DS_MSR_EE = 0x00008000u,
     SMG3DS_MSR_FP = 0x00002000u,
     SMG3DS_PPC_EXC_EXTERNAL = 0x00000040u,
@@ -101,8 +133,93 @@ enum {
     SMG3DS_FILE_RIPPER_AFTER_SAVE_GPRS = 0x8039862cu,
     SMG3DS_FILE_RIPPER_EXISTS_CALL = 0x80398654u,
     SMG3DS_FILE_RIPPER_EXISTS_RETURN = 0x8039865cu,
+    SMG3DS_SETUP_RSO_HOME_BUTTON_MENU = 0x803ACA54u,
+    SMG3DS_MR_IS_EQUAL_STRING_CASE = 0x803FD4C8u,
+    SMG3DS_FILE_RIPPER_YAZ0_LOOP = 0x80398A20u,
+    SMG3DS_FILE_RIPPER_YAZ0_EPILOGUE = 0x80398AECu,
+    SMG3DS_KPAD_READ = 0x804506D8u,
+    SMG3DS_CACHE_RANGE_BEGIN = 0x804A2F20u,
+    SMG3DS_CACHE_RANGE_END = 0x804A2FD4u,
     SMG3DS_FILE_RIPPER_PATH_LIMIT = 256
 };
+enum {
+    SMG3DS_KPAD_STATUS_SIZE = 132,
+    SMG3DS_KPAD_BUTTON_LEFT = 0x0001u,
+    SMG3DS_KPAD_BUTTON_RIGHT = 0x0002u,
+    SMG3DS_KPAD_BUTTON_DOWN = 0x0004u,
+    SMG3DS_KPAD_BUTTON_UP = 0x0008u,
+    SMG3DS_KPAD_BUTTON_PLUS = 0x0010u,
+    SMG3DS_KPAD_BUTTON_2 = 0x0100u,
+    SMG3DS_KPAD_BUTTON_1 = 0x0200u,
+    SMG3DS_KPAD_BUTTON_B = 0x0400u,
+    SMG3DS_KPAD_BUTTON_A = 0x0800u,
+    SMG3DS_KPAD_BUTTON_MINUS = 0x1000u,
+    SMG3DS_KPAD_BUTTON_Z = 0x2000u,
+    SMG3DS_KPAD_BUTTON_C = 0x4000u
+};
+
+static u32 f32_bits(float value)
+{
+    union {
+        float value;
+        u32 bits;
+    } conversion;
+
+    conversion.value = value;
+    return conversion.bits;
+}
+
+static float clamp_unit(float value)
+{
+    if (value < -1.0f)
+        return -1.0f;
+    if (value > 1.0f)
+        return 1.0f;
+    return value;
+}
+
+static u32 map_host_kpad_buttons(u32 keys)
+{
+    u32 buttons = 0u;
+
+    if ((keys & KEY_DLEFT) != 0u)
+        buttons |= SMG3DS_KPAD_BUTTON_LEFT;
+    if ((keys & KEY_DRIGHT) != 0u)
+        buttons |= SMG3DS_KPAD_BUTTON_RIGHT;
+    if ((keys & KEY_DDOWN) != 0u)
+        buttons |= SMG3DS_KPAD_BUTTON_DOWN;
+    if ((keys & KEY_DUP) != 0u)
+        buttons |= SMG3DS_KPAD_BUTTON_UP;
+    if ((keys & KEY_START) != 0u)
+        buttons |= SMG3DS_KPAD_BUTTON_PLUS;
+    if ((keys & KEY_Y) != 0u)
+        buttons |= SMG3DS_KPAD_BUTTON_2;
+    if ((keys & KEY_X) != 0u)
+        buttons |= SMG3DS_KPAD_BUTTON_1;
+    if ((keys & KEY_B) != 0u)
+        buttons |= SMG3DS_KPAD_BUTTON_B;
+    if ((keys & KEY_A) != 0u)
+        buttons |= SMG3DS_KPAD_BUTTON_A;
+    if ((keys & KEY_SELECT) != 0u)
+        buttons |= SMG3DS_KPAD_BUTTON_MINUS;
+    if ((keys & (KEY_L | KEY_ZL)) != 0u)
+        buttons |= SMG3DS_KPAD_BUTTON_Z;
+    if ((keys & (KEY_R | KEY_ZR)) != 0u)
+        buttons |= SMG3DS_KPAD_BUTTON_C;
+    return buttons;
+}
+
+static void update_host_controller(void)
+{
+    hidScanInput();
+    g_host_keys_held = hidKeysHeld();
+    g_host_keys_latched_down |= hidKeysDown();
+    hidCircleRead(&g_host_circle);
+    g_host_touch_active = (g_host_keys_held & KEY_TOUCH) != 0u;
+    if (g_host_touch_active)
+        hidTouchRead(&g_host_touch);
+}
+
 
 static bool guest_range_valid(const CPUState* cpu, u32 address, u32 size)
 {
@@ -115,6 +232,99 @@ static bool guest_range_valid(const CPUState* cpu, u32 address, u32 size)
         return true;
     return physical >= 0x10000000u &&
            end <= 0x10000000ull + SMG3DS_MEM2_SIZE;
+}
+static bool service_kpad_read(CPUState* cpu)
+{
+    const u32 channel = cpu->gpr[3];
+    const u32 status = cpu->gpr[4];
+    const u32 capacity = cpu->gpr[5];
+    const u32 host_keys = g_host_keys_held | g_host_keys_latched_down;
+    u32 hold;
+    float stick_x;
+    float stick_y;
+    float pointer_x = 0.0f;
+    float pointer_y = 0.0f;
+    float accel_x = 0.0f;
+
+    ++g_kpad_reads;
+    if (channel != 0u || capacity == 0u ||
+        !guest_range_valid(cpu, status, SMG3DS_KPAD_STATUS_SIZE)) {
+        cpu->gpr[3] = 0u;
+        cpu->pc = cpu->lr & ~3u;
+        return true;
+    }
+
+    for (u32 offset = 0u; offset < SMG3DS_KPAD_STATUS_SIZE; offset += 4u)
+        mem_write32(cpu, status + offset, 0u);
+
+    hold = map_host_kpad_buttons(host_keys);
+    mem_write32(cpu, status + 0u, hold);
+    mem_write32(cpu, status + 4u, hold & ~g_kpad_previous_hold);
+    mem_write32(cpu, status + 8u, g_kpad_previous_hold & ~hold);
+    g_kpad_previous_hold = hold;
+
+    /* A stable, upright Wii Remote, with X also providing a shake/spin. */
+    if ((host_keys & KEY_X) != 0u) {
+        g_kpad_shake_phase = !g_kpad_shake_phase;
+        accel_x = g_kpad_shake_phase ? 2.5f : -2.5f;
+    }
+    mem_write32(cpu, status + 12u, f32_bits(accel_x));
+    mem_write32(cpu, status + 16u, f32_bits(0.0f));
+    mem_write32(cpu, status + 20u, f32_bits(1.0f));
+    mem_write32(cpu, status + 24u, f32_bits(1.0f));
+
+    if (g_host_touch_active) {
+        pointer_x = clamp_unit(((float)g_host_touch.px / 159.5f) - 1.0f);
+        pointer_y = clamp_unit(1.0f - ((float)g_host_touch.py / 119.5f));
+    }
+    mem_write32(cpu, status + 32u, f32_bits(pointer_x));
+    mem_write32(cpu, status + 36u, f32_bits(pointer_y));
+    mem_write32(cpu, status + 48u, f32_bits(1.0f));
+    mem_write32(cpu, status + 52u, f32_bits(0.0f));
+    mem_write32(cpu, status + 56u, f32_bits(1.0f));
+
+    /* KPAD device 1 is a Wii Remote with Nunchuk ("freestyle"). */
+    mem_write8(cpu, status + 92u, 1u);
+    mem_write8(cpu, status + 93u, 0u);
+    mem_write8(cpu, status + 94u, g_host_touch_active ? 1u : 0u);
+    stick_x = clamp_unit((float)g_host_circle.dx / 156.0f);
+    stick_y = clamp_unit((float)g_host_circle.dy / 156.0f);
+    mem_write32(cpu, status + 96u, f32_bits(stick_x));
+    mem_write32(cpu, status + 100u, f32_bits(stick_y));
+
+    g_host_keys_latched_down = 0u;
+    ++g_kpad_samples;
+    cpu->gpr[3] = 1u;
+    cpu->pc = cpu->lr & ~3u;
+    return true;
+}
+
+
+static bool guest_strings_equal_case(CPUState* cpu, u32 left, u32 right)
+{
+    enum { SMG3DS_GUEST_STRING_LIMIT = 4096 };
+
+    if (left == 0u || right == 0u)
+        return false;
+    for (u32 offset = 0u; offset < SMG3DS_GUEST_STRING_LIMIT; ++offset) {
+        u8 left_value;
+        u8 right_value;
+
+        if (!guest_range_valid(cpu, left + offset, 1u) ||
+            !guest_range_valid(cpu, right + offset, 1u))
+            return false;
+        left_value = mem_read8(cpu, left + offset);
+        right_value = mem_read8(cpu, right + offset);
+        if (left_value >= (u8)'A' && left_value <= (u8)'Z')
+            left_value = (u8)(left_value + ((u8)'a' - (u8)'A'));
+        if (right_value >= (u8)'A' && right_value <= (u8)'Z')
+            right_value = (u8)(right_value + ((u8)'a' - (u8)'A'));
+        if (left_value != right_value)
+            return false;
+        if (left_value == 0u)
+            return true;
+    }
+    return false;
 }
 
 static void guest_copy_string(CPUState* cpu, u32 address,
@@ -195,8 +405,19 @@ int dolrecomp_dispatch_replacement(CPUState* cpu, u32 address)
     s32 entry_index;
     bool opened;
 
+    if (address == SMG3DS_KPAD_READ)
+        return service_kpad_read(cpu) ? 1 : 0;
+
     if (smg3ds_petari_dispatch(cpu, address))
         return 1;
+
+    if (address == SMG3DS_MR_IS_EQUAL_STRING_CASE) {
+        cpu->gpr[3] = guest_strings_equal_case(cpu, cpu->gpr[3],
+                                                 cpu->gpr[4]) ? 1u : 0u;
+        cpu->pc = cpu->lr & ~3u;
+        ++g_case_compare_fast_paths;
+        return 1;
+    }
 
     if (address == SMG3DS_DVD_CONVERT_PATH_TO_ENTRYNUM) {
         if (!smg3ds_disc_resolve_path(cpu, cpu->gpr[3], &entry_index))
@@ -414,6 +635,139 @@ static void advance_timebase_from_execution(CPUState* cpu)
         accumulated_cycles % SMG3DS_BROADWAY_CYCLES_PER_TIMEBASE_TICK);
 }
 
+static bool service_coherent_cache_range(CPUState* cpu)
+{
+    if (cpu->pc < SMG3DS_CACHE_RANGE_BEGIN ||
+        cpu->pc > SMG3DS_CACHE_RANGE_END)
+        return false;
+
+    cpu->ctr = 0u;
+    cpu->pc = cpu->lr & ~3u;
+    cpu->downcount = -8;
+    ++g_cache_range_skips;
+    return true;
+}
+
+static bool service_yaz0_decompression(CPUState* cpu)
+{
+    enum { SMG3DS_YAZ0_OUTPUT_BUDGET = 64 * 1024 };
+    u32 source;
+    u32 destination;
+    const u32 destination_end = cpu->gpr[30];
+    u32 bits_remaining;
+    u32 code;
+    u32 produced = 0u;
+
+    if (cpu->pc != SMG3DS_FILE_RIPPER_YAZ0_LOOP ||
+        cpu->gpr[13] < 10344u)
+        return false;
+    source = cpu->gpr[3];
+    destination = cpu->gpr[31];
+    bits_remaining = cpu->gpr[7];
+    code = cpu->gpr[8];
+    if (destination > destination_end)
+        return false;
+
+    /*
+     * FileRipper's Yaz0 decoder spends most of scene loading interpreting
+     * one byte at a time. Decode the current streaming input window natively,
+     * then return to readSrcDataNext whenever the guest buffer needs refilling.
+     * Completing whole tokens preserves overlapping back-references exactly.
+     */
+    while (destination < destination_end &&
+           produced < SMG3DS_YAZ0_OUTPUT_BUDGET) {
+        if (bits_remaining == 0u) {
+            const u32 source_end = mem_read32(cpu, cpu->gpr[13] - 10344u);
+
+            if (source > source_end)
+                break;
+            if (!guest_range_valid(cpu, source, 1u))
+                return false;
+            code = mem_read8(cpu, source++);
+            bits_remaining = 8u;
+        }
+
+        if ((code & 0x80u) != 0u) {
+            if (!guest_range_valid(cpu, source, 1u) ||
+                !guest_range_valid(cpu, destination, 1u))
+                return false;
+            mem_write8(cpu, destination++, mem_read8(cpu, source++));
+            ++produced;
+        } else {
+            u32 first;
+            u32 second;
+            u32 length;
+            u32 copy_source;
+
+            if (!guest_range_valid(cpu, source, 2u))
+                return false;
+            first = mem_read8(cpu, source++);
+            second = mem_read8(cpu, source++);
+            copy_source = destination - (((first & 0x0fu) << 8) | second) - 1u;
+            length = first >> 4;
+            if (length == 0u) {
+                if (!guest_range_valid(cpu, source, 1u))
+                    return false;
+                length = mem_read8(cpu, source++) + 18u;
+            } else {
+                length += 2u;
+            }
+            while (length-- != 0u && destination < destination_end) {
+                if (!guest_range_valid(cpu, copy_source, 1u) ||
+                    !guest_range_valid(cpu, destination, 1u))
+                    return false;
+                mem_write8(cpu, destination++, mem_read8(cpu, copy_source++));
+                ++produced;
+            }
+        }
+        code = (code << 1) & 0xffu;
+        --bits_remaining;
+    }
+
+    cpu->gpr[3] = source;
+    cpu->gpr[7] = bits_remaining;
+    cpu->gpr[8] = code;
+    cpu->gpr[31] = destination;
+    if (destination >= destination_end) {
+        cpu->gpr[3] = 1u;
+        cpu->pc = SMG3DS_FILE_RIPPER_YAZ0_EPILOGUE;
+    } else if (produced == 0u) {
+        return false;
+    } else {
+        cpu->pc = SMG3DS_FILE_RIPPER_YAZ0_LOOP;
+    }
+    cpu->downcount = -8;
+    ++g_yaz0_fast_paths;
+    g_yaz0_fast_bytes += produced;
+    return true;
+}
+
+static uint32_t ai_current_sample_count(const CPUState* cpu)
+{
+    const u32 sample_rate = (g_ai_control & 0x02u) != 0u ? 48000u : 32000u;
+    const u64 elapsed = cpu->timebase - g_ai_sample_timebase;
+
+    if ((g_ai_control & 0x01u) == 0u)
+        return g_ai_sample_count;
+    return g_ai_sample_count + (u32)(
+        (elapsed * sample_rate) / SMG3DS_TIMEBASE_FREQUENCY);
+}
+
+static void ai_write_control(CPUState* cpu, u32 value)
+{
+    const u32 interrupt_status = g_ai_control & 0x08u;
+
+    g_ai_sample_count = ai_current_sample_count(cpu);
+    g_ai_sample_timebase = cpu->timebase;
+    if ((value & 0x20u) != 0u)
+        g_ai_sample_count = 0u;
+
+    /* SCRESET is a write pulse and AIINT is write-one-to-clear. */
+    g_ai_control = value & 0x57u;
+    if ((value & 0x08u) == 0u)
+        g_ai_control |= interrupt_status;
+}
+
 static bool mem2_offset(uint32_t address, uint8_t size, uint32_t* offset)
 {
     const uint32_t physical = mmio_physical(address);
@@ -451,7 +805,10 @@ static void mem2_write_sparse(uint32_t offset, uint64_t value, uint8_t size)
         if (g_mem2_pages[page] == NULL) {
             if (byte == 0u)
                 continue;
-            g_mem2_pages[page] = (uint8_t*)calloc(1, SMG3DS_MEM2_PAGE_SIZE);
+            g_mem2_pages[page] =
+                (uint8_t*)linearMemAlign(SMG3DS_MEM2_PAGE_SIZE, 0x80u);
+            if (g_mem2_pages[page] != NULL)
+                memset(g_mem2_pages[page], 0, SMG3DS_MEM2_PAGE_SIZE);
             if (g_mem2_pages[page] == NULL) {
                 g_mem2_out_of_memory = true;
                 return;
@@ -466,7 +823,7 @@ static void mem2_free_sparse(void)
 {
     uint32_t page;
     for (page = 0; page < SMG3DS_MEM2_PAGE_COUNT; ++page) {
-        free(g_mem2_pages[page]);
+        linearFree(g_mem2_pages[page]);
         g_mem2_pages[page] = NULL;
     }
     g_mem2_pages_used = 0;
@@ -519,10 +876,22 @@ static uint32_t pi_interrupt_cause(void)
         cause |= SMG3DS_PI_VI;
     else
         cause &= ~SMG3DS_PI_VI;
+    if ((g_pe_interrupt_control & 0x05u) == 0x05u)
+        cause |= SMG3DS_PI_PE_TOKEN;
+    else
+        cause &= ~SMG3DS_PI_PE_TOKEN;
+    if ((g_pe_interrupt_control & 0x0au) == 0x0au)
+        cause |= SMG3DS_PI_PE_FINISH;
+    else
+        cause &= ~SMG3DS_PI_PE_FINISH;
     if (smg3ds_exi_interrupt_pending())
         cause |= SMG3DS_PI_EXI;
     else
         cause &= ~SMG3DS_PI_EXI;
+    if (((g_dsp_control | g_dsp_hardware_status) & 0x0180u) == 0x0180u)
+        cause |= SMG3DS_PI_DSP;
+    else
+        cause &= ~SMG3DS_PI_DSP;
     if (g_ipc_irq_flag != 0u)
         cause |= SMG3DS_PI_WII_IPC;
     return cause;
@@ -555,6 +924,66 @@ static void signal_video_retrace(void)
         mmio_shadow_write(address, control, 2u);
     }
     update_pi_external_pending();
+}
+static u32 guest_retrace_queue(CPUState* cpu)
+{
+    u32 framework;
+
+    if (cpu->gpr[13] == 0u)
+        return 0u;
+    framework = mem_read32(cpu, cpu->gpr[13] - 9296u);
+    if (!guest_range_valid(cpu, framework, 88u))
+        return 0u;
+    return framework + 56u;
+}
+
+static void observe_guest_retrace_wait(CPUState* cpu)
+{
+    const u32 queue = guest_retrace_queue(cpu);
+
+    /*
+     * MainLoopFramework::waitForTick receives retraces through this blocking
+     * OSMessageQueue. Once that path is live, pace VI delivery to the guest's
+     * demand instead of the much faster host render loop. Otherwise a retrace
+     * is always queued before OSReceiveMessage and the main thread never sleeps,
+     * starving lower-priority scene-loading workers.
+     */
+    if (cpu->pc == 0x804A89ACu && cpu->gpr[5] != 0u &&
+        queue != 0u && cpu->gpr[3] == queue)
+        g_vi_demand_pacing = true;
+}
+
+static bool guest_is_waiting_for_retrace(CPUState* cpu)
+{
+    const u32 queue = guest_retrace_queue(cpu);
+
+    if (queue == 0u)
+        return false;
+    /* OSMessageQueue::queueReceive is the OSThreadQueue at offset 8. */
+    return mem_read32(cpu, queue + 8u) != 0u;
+}
+
+
+static bool service_optional_platform_module(CPUState* cpu)
+{
+    const u32 callback_offset = cpu->pc - 0x803ACB88u;
+
+    /*
+     * The Wii Home Button overlay is an optional dynamically loaded RSO.
+     * It has no 3DS-side input path and its runtime code is outside the
+     * statically recompiled DOL, so leave setup and its seven callback
+     * trampolines inactive.
+     */
+    if (cpu->pc == SMG3DS_SETUP_RSO_HOME_BUTTON_MENU) {
+        cpu->pc = cpu->lr & ~3u;
+        return true;
+    }
+    if (callback_offset > 0x48u || callback_offset % 0x0cu != 0u)
+        return false;
+
+    cpu->gpr[3] = 0u;
+    cpu->pc = cpu->lr & ~3u;
+    return true;
 }
 
 static void ipc_signal(u32 interrupt_enable_mask)
@@ -600,8 +1029,14 @@ static void service_deferred_ipc(CPUState* cpu)
     u32 request;
     s32 result;
 
-    /* IOS may publish only one Y1 reply at a time. */
-    if ((g_ipc_control & 0x05u) != 0u)
+    /*
+     * Starlet may publish a Y1 reply only after Broadway has consumed the
+     * preceding Y2 acknowledgement and cleared its IPC interrupt.  Sending
+     * both phases together collapses two level-triggered interrupts into one;
+     * asynchronous clients then observe the acknowledgement but never run the
+     * completion callback for the reply.
+     */
+    if ((g_ipc_control & 0x07u) != 0u || g_ipc_irq_flag != 0u)
         return;
     if (smg3ds_ios_take_deferred_reply(&request, &result))
         ipc_reply_request(cpu, request, result, false);
@@ -706,6 +1141,10 @@ static u64 external_read(CPUState* cpu, u32 address, u8 size)
         return g_ipc_irq_flag;
     if (physical == 0x0d000034u)
         return g_ipc_irq_mask;
+    if (physical == 0x0d006c00u && size == 4u)
+        return g_ai_control;
+    if (physical == 0x0d006c08u && size == 4u)
+        return ai_current_sample_count(cpu);
     if (physical == 0x0c003000u)
         return pi_interrupt_cause();
     if (physical == 0x0c003004u)
@@ -718,17 +1157,27 @@ static u64 external_read(CPUState* cpu, u32 address, u8 size)
             g_dsp_hardware_status &= (u16)~0x0400u;
         return status;
     }
+    if (physical == 0x0c005000u)
+        return g_dsp_to_mail >> 16;
     if (physical == 0x0c005004u)
         return g_dsp_from_mail >> 16;
     if (physical == 0x0c005006u) {
         value = g_dsp_from_mail & 0xffffu;
-        g_dsp_from_mail &= 0x7fffffffu;
+        if (g_dsp_next_mail != 0u) {
+            g_dsp_from_mail = g_dsp_next_mail;
+            g_dsp_next_mail = 0u;
+        } else {
+            g_dsp_from_mail &= 0x7fffffffu;
+        }
+        ++g_dsp_mail_reads;
         return value;
     }
     if (physical == 0x0c005016u)
         return 1u;
     if (physical == 0x0c00501au)
         return 156u;
+    if (physical == SMG3DS_PE_INTERRUPT_CONTROL && size == 2u)
+        return g_pe_interrupt_control;
 
 
     return mmio_shadow_read(physical, size);
@@ -749,6 +1198,10 @@ static void external_write(CPUState* cpu, u32 address, u64 value, u8 size)
     if (is_gx_mmio_access(physical)) {
         ++g_gx_mmio_writes;
         smg3ds_gx_fifo_write(value, size);
+        if (smg3ds_gx_take_finish_request()) {
+            g_pe_interrupt_control |= 0x08u;
+            update_pi_external_pending();
+        }
         return;
     }
     if (smg3ds_exi_handles(physical, size)) {
@@ -790,6 +1243,15 @@ static void external_write(CPUState* cpu, u32 address, u64 value, u8 size)
         g_ipc_irq_mask = (u32)value;
         return;
     }
+    if (physical == 0x0d006c00u && size == 4u) {
+        ai_write_control(cpu, (u32)value);
+        return;
+    }
+    if (physical == 0x0d006c08u && size == 4u) {
+        g_ai_sample_count = (u32)value;
+        g_ai_sample_timebase = cpu->timebase;
+        return;
+    }
     if (physical == 0x0c003000u && size == 4u) {
         g_pi_cause &= ~(u32)value;
         update_pi_external_pending();
@@ -797,6 +1259,60 @@ static void external_write(CPUState* cpu, u32 address, u64 value, u8 size)
     }
     if (physical == 0x0c003004u && size == 4u) {
         g_pi_mask = (u32)value;
+        update_pi_external_pending();
+        return;
+    }
+    if (physical == 0x0c005000u && size == 2u) {
+        g_dsp_to_mail = ((u32)value << 16) | (g_dsp_to_mail & 0xffffu);
+        return;
+    }
+    if (physical == 0x0c005002u && size == 2u) {
+        const u32 mail = (g_dsp_to_mail & 0xffff0000u) |
+                         (u32)(u16)value | 0x80000000u;
+
+        switch (mail) {
+        case 0x80f3a001u:
+        case 0x80f3c002u:
+        case 0x80f3a002u:
+        case 0x80f3b002u:
+        case 0x80f3d001u:
+            g_dsp_boot_command = mail;
+            break;
+        default:
+            if (g_dsp_boot_command != 0u) {
+                if (g_dsp_boot_command == 0x80f3d001u) {
+                    g_dsp_from_mail = 0xdcd10000u;
+                    g_dsp_next_mail = 0xf3551111u;
+                    g_dsp_hardware_status |= 0x0080u;
+                    ++g_dsp_ready_mails;
+                }
+                g_dsp_boot_command = 0u;
+            } else if (g_dsp_packet_words == 0u &&
+                       (mail & 0x7fffffffu) <= 16u) {
+                g_dsp_packet_words = mail & 0x7fffffffu;
+                g_dsp_packet_tag = 0u;
+            } else if (g_dsp_packet_words != 0u) {
+                if (g_dsp_packet_tag == 0u)
+                    g_dsp_packet_tag = (mail >> 16) & 0xffffu;
+                if (--g_dsp_packet_words == 0u) {
+                    g_dsp_from_mail = 0xdcd10004u;
+                    g_dsp_next_mail = 0xf3550000u | g_dsp_packet_tag;
+                    g_dsp_hardware_status |= 0x0080u;
+                    ++g_dsp_ready_mails;
+                }
+            }
+            break;
+        }
+        g_dsp_to_mail = mail & 0x7fffffffu;
+        g_dsp_control &= (u16)~0x0002u;
+        update_pi_external_pending();
+        return;
+    }
+    if (physical == SMG3DS_PE_INTERRUPT_CONTROL && size == 2u) {
+        const u16 requested = (u16)value;
+        u16 pending = g_pe_interrupt_control & 0x0cu;
+        pending &= (u16)~(requested & 0x0cu);
+        g_pe_interrupt_control = (requested & 0x03u) | pending;
         update_pi_external_pending();
         return;
     }
@@ -813,18 +1329,21 @@ static void external_write(CPUState* cpu, u32 address, u64 value, u8 size)
         g_dsp_hardware_status &= (u16)~(requested & write_one_to_clear);
         g_dsp_control = requested &
             (u16)~(write_one_to_clear | 0x0001u | 0x0600u);
+        if ((requested & 0x0001u) != 0u)
+            g_dsp_ready_mail = 0x8071feedu;
         if ((old_control & 0x0800u) != 0u &&
             (requested & 0x0800u) == 0u) {
-            g_dsp_boot_armed = true;
+            g_dsp_ready_mail = 0x80544348u;
             g_dsp_hardware_status |= 0x0400u;
             g_dsp_init_code_reads = 1u;
         }
-        if (g_dsp_boot_armed && (old_control & 0x0004u) != 0u &&
+        if (g_dsp_ready_mail != 0u && (old_control & 0x0004u) != 0u &&
             (requested & 0x0004u) == 0u) {
-            g_dsp_from_mail = 0x80544348u;
-            g_dsp_hardware_status |= 0x0200u;
-            g_dsp_boot_armed = false;
+            g_dsp_from_mail = g_dsp_ready_mail;
+            ++g_dsp_ready_mails;
+            g_dsp_ready_mail = 0u;
         }
+        update_pi_external_pending();
         return;
     }
     if ((physical == 0x0c00502au && size == 2u) ||
@@ -1030,33 +1549,35 @@ int main(void)
             printf("PPC execution: %s\n",
                    running ? "auto-started" :
                    "blocked: renderer/EXI/GPIO/disc preflight failed");
-            printf("A: pause/resume\n");
         }
     }
 #else
     printf("\nGenerated game code: not configured\n");
     printf("Run tools/configure.ps1 with your DOL.\n");
 #endif
-    printf("START: exit\n");
-
     while (aptMainLoop()) {
-        hidScanInput();
-        const u32 down = hidKeysDown();
-        if ((down & KEY_START) != 0)
-            break;
+        update_host_controller();
 #ifdef SMG3DS_WITH_GENERATED
-        if ((down & KEY_A) != 0 && dol_ok && geometry_ok &&
-            exi_ok && gpio_ok && disc_ok) {
-            running = !running;
-            printf("\x1b[16;1H%-39s", running ? "PPC execution: running" :
-                                                  "PPC execution: paused");
-        }
         if (running && dol_ok) {
             const u64 frame_timebase_target =
                 cpu.timebase + SMG3DS_TIMEBASE_PER_FRAME;
-            signal_video_retrace();
-            for (u32 slice = 0; slice < SMG3DS_DISPATCHES_PER_FRAME && running;
+            const u64 cpu_slice_deadline =
+                osGetTime() + SMG3DS_CPU_SLICE_MILLISECONDS;
+            if (!g_vi_demand_pacing ||
+                (guest_is_waiting_for_retrace(&cpu) &&
+                 !vi_interrupt_pending()))
+                signal_video_retrace();
+            for (u32 slice = 0;
+                 slice < SMG3DS_MAX_DISPATCHES_PER_FRAME && running;
                  ++slice) {
+                /*
+                 * A generated block may cover a sizeable guest function.  Keep
+                 * at least one block per frame, then yield before another block
+                 * can starve presentation, input, and runtime diagnostics.
+                 */
+                if (slice != 0u && osGetTime() >= cpu_slice_deadline)
+                    break;
+                observe_guest_retrace_wait(&cpu);
                 service_deferred_ipc(&cpu);
                 service_external_interrupt(&cpu);
                 service_decrementer_interrupt(&cpu);
@@ -1085,8 +1606,16 @@ int main(void)
                     cpu.gpr[3] = cpu.gpr[26];
                     cpu.pc = SMG3DS_FILE_RIPPER_EXISTS_CALL;
                 }
+                int dispatched;
                 cpu.downcount = 0;
-                const int dispatched = dolrecomp_run_blocks(&cpu, 1u);
+                if (service_yaz0_decompression(&cpu))
+                    dispatched = 1;
+                else if (service_optional_platform_module(&cpu))
+                    dispatched = 1;
+                else if (service_coherent_cache_range(&cpu))
+                    dispatched = 1;
+                else
+                    dispatched = dolrecomp_run_blocks(&cpu, 1u);
                 advance_timebase_from_execution(&cpu);
                 bool handled_system_call = false;
                 if (cpu.exception == PPC_EXC_SYSTEM_CALL) {
@@ -1176,34 +1705,171 @@ int main(void)
                        (unsigned long)g_dsp_control,
                        (unsigned long)g_dsp_hardware_status,
                        (unsigned long)gx->fifo_bytes);
-                printf("\x1b[24;1Hgx d=%lu tri=%lu pix=%lu fail=%lu self=%u\x1b[K",
+                printf("\x1b[24;1Hgx d=%lu tri=%lu pix=%lu/%lu xfb=%lu\x1b[K",
                        (unsigned long)gx->draw_calls,
                        (unsigned long)gx->triangles,
                        (unsigned long)gx->rasterized_pixels,
-                       (unsigned long)gx->decode_failures,
-                       gx->geometry_self_test_passed ? 1u : 0u);
-                if (++g_debug_frames >= 120u) {
+                       (unsigned long)gx->colored_pixels,
+                       (unsigned long)gx->xfb_colored_pixels);
+                if (++g_debug_frames >= SMG3DS_DEBUG_LOG_FRAMES) {
                     const u32 run_queue_addr =
                         cpu.gpr[13] + (u32)(s32)(-8048);
                     const u32 run_queue_bits =
                         mem_read32(&cpu, run_queue_addr);
+                    const u32 game_system = mem_read32(
+                        &cpu, cpu.gpr[13] + (u32)(s32)(-14968));
+                    const u32 game_spine =
+                        guest_range_valid(&cpu, game_system, 12u) ?
+                            mem_read32(&cpu, game_system + 4u) : 0u;
+                    const u32 game_nerve =
+                        guest_range_valid(&cpu, game_spine, 16u) ?
+                            mem_read32(&cpu, game_spine + 4u) : 0u;
+                    const u32 game_nerve_vtable =
+                        guest_range_valid(&cpu, game_nerve, 4u) ?
+                            mem_read32(&cpu, game_nerve) : 0u;
+                    const u32 game_nerve_execute =
+                        guest_range_valid(&cpu, game_nerve_vtable, 12u) ?
+                            mem_read32(&cpu, game_nerve_vtable + 8u) : 0u;
+                    const u32 game_next_nerve =
+                        guest_range_valid(&cpu, game_spine, 16u) ?
+                            mem_read32(&cpu, game_spine + 8u) : 0u;
+                    const u32 game_nerve_step =
+                        guest_range_valid(&cpu, game_spine, 16u) ?
+                            mem_read32(&cpu, game_spine + 12u) : 0u;
+                    const u32 scene_controller =
+                        guest_range_valid(&cpu, game_system, 40u) ?
+                            mem_read32(&cpu, game_system + 36u) : 0u;
+                    const u32 scene_spine =
+                        guest_range_valid(&cpu, scene_controller, 156u) ?
+                            mem_read32(&cpu, scene_controller + 152u) : 0u;
+                    const u32 scene_nerve =
+                        guest_range_valid(&cpu, scene_spine, 16u) ?
+                            mem_read32(&cpu, scene_spine + 4u) : 0u;
+                    const u32 scene_nerve_vtable =
+                        guest_range_valid(&cpu, scene_nerve, 4u) ?
+                            mem_read32(&cpu, scene_nerve) : 0u;
+                    const u32 scene_nerve_execute =
+                        guest_range_valid(&cpu, scene_nerve_vtable, 12u) ?
+                            mem_read32(&cpu, scene_nerve_vtable + 8u) : 0u;
+                    const u32 scene_next_nerve =
+                        guest_range_valid(&cpu, scene_spine, 16u) ?
+                            mem_read32(&cpu, scene_spine + 8u) : 0u;
+                    const u32 scene_nerve_step =
+                        guest_range_valid(&cpu, scene_spine, 16u) ?
+                            mem_read32(&cpu, scene_spine + 12u) : 0u;
+                    const u32 scene_object =
+                        guest_range_valid(&cpu, scene_controller, 180u) ?
+                            mem_read32(&cpu, scene_controller + 164u) : 0u;
+                    const u32 scene_init_state =
+                        guest_range_valid(&cpu, scene_controller, 180u) ?
+                            mem_read32(&cpu, scene_controller + 176u) : 0u;
+                    const u32 game_obj_holder =
+                        guest_range_valid(&cpu, game_system, 36u) ?
+                            mem_read32(&cpu, game_system + 32u) : 0u;
+                    const u32 async_executor =
+                        guest_range_valid(&cpu, game_obj_holder, 44u) ?
+                            mem_read32(&cpu, game_obj_holder + 40u) : 0u;
+                    const u32 async_worker0 =
+                        guest_range_valid(&cpu, async_executor, 8u) ?
+                            mem_read32(&cpu, async_executor) : 0u;
+                    const u32 async_worker1 =
+                        guest_range_valid(&cpu, async_executor, 8u) ?
+                            mem_read32(&cpu, async_executor + 4u) : 0u;
+                    const u32 async_thread0 =
+                        guest_range_valid(&cpu, async_worker0, 12u) ?
+                            mem_read32(&cpu, async_worker0 + 8u) : 0u;
+                    const u32 async_thread1 =
+                        guest_range_valid(&cpu, async_worker1, 12u) ?
+                            mem_read32(&cpu, async_worker1 + 8u) : 0u;
+                    const u32 async_job_count =
+                        guest_range_valid(&cpu, async_executor, 1040u) ?
+                            mem_read32(&cpu, async_executor + 1036u) : 0u;
+                    const u32 async_job0 =
+                        async_job_count != 0u ?
+                            mem_read32(&cpu, async_executor + 12u) : 0u;
+                    const u8 async_job0_done =
+                        guest_range_valid(&cpu, async_job0, 13u) ?
+                            mem_read8(&cpu, async_job0 + 12u) : 0u;
+                    const u16 async_thread0_state =
+                        guest_range_valid(&cpu, async_thread0, 0x304u) ?
+                            mem_read16(&cpu, async_thread0 + 0x2c8u) : 0u;
+                    const u16 async_thread1_state =
+                        guest_range_valid(&cpu, async_thread1, 0x304u) ?
+                            mem_read16(&cpu, async_thread1 + 0x2c8u) : 0u;
+                    const u32 async_thread0_pc =
+                        guest_range_valid(&cpu, async_thread0, 0x304u) ?
+                            mem_read32(&cpu, async_thread0 + 408u) : 0u;
+                    const u32 async_thread1_pc =
+                        guest_range_valid(&cpu, async_thread1, 0x304u) ?
+                            mem_read32(&cpu, async_thread1 + 408u) : 0u;
+                    const u8 async_worker0_busy =
+                        guest_range_valid(&cpu, async_worker0, 61u) ?
+                            mem_read8(&cpu, async_worker0 + 60u) : 0u;
+                    const u8 async_worker1_busy =
+                        guest_range_valid(&cpu, async_worker1, 61u) ?
+                            mem_read8(&cpu, async_worker1 + 60u) : 0u;
                     const u32 vector_900_0 =
                         mem_read32(&cpu, 0x80000900u);
                     const u32 vector_900_1 =
                         mem_read32(&cpu, 0x80000904u);
+                    const u32 current_thread =
+                        mem_read32(&cpu, 0x800000e4u);
+                    u32 thread_ptrs[4] = {0u, 0u, 0u, 0u};
+                    u32 thread_pcs[4] = {0u, 0u, 0u, 0u};
+                    u32 thread_queues[4] = {0u, 0u, 0u, 0u};
+                    u32 thread_callers[4][3] = {{0u}};
+                    u16 thread_states[4] = {0u, 0u, 0u, 0u};
+                    u32 active_thread = mem_read32(&cpu, 0x800000dcu);
                     const char* ios_path = smg3ds_ios_fd_path(ios->last_fd);
-                    char message[640];
+                    char message[2048];
                     int length;
+                    for (u32 i = 0u; i < 4u; ++i) {
+                        if (!guest_range_valid(&cpu, active_thread, 0x304u))
+                            break;
+                        thread_ptrs[i] = active_thread;
+                        thread_pcs[i] = mem_read32(&cpu, active_thread + 408u);
+                        thread_states[i] = mem_read16(&cpu,
+                                                     active_thread + 0x2c8u);
+                        thread_queues[i] = mem_read32(&cpu,
+                                                     active_thread + 0x2dcu);
+                        u32 frame = mem_read32(&cpu, active_thread + 4u);
+                        for (u32 depth = 0u; depth < 3u; ++depth) {
+                            if (!guest_range_valid(&cpu, frame, 8u))
+                                break;
+                            thread_callers[i][depth] =
+                                mem_read32(&cpu, frame + 4u);
+                            const u32 next_frame = mem_read32(&cpu, frame);
+                            if (next_frame == frame)
+                                break;
+                            frame = next_frame;
+                        }
+                        active_thread = mem_read32(&cpu,
+                                                  active_thread + 0x2fcu);
+                    }
                     g_debug_frames = 0;
                     length = snprintf(
                         message, sizeof(message),
                         "SMG3DS pc=%08lX ex=%lu blk=%lu ctl=%04lX hw=%04lX "
                         "val=%04lX mmio=%lu gxw=%lu w=%lu fifo=%lu cmd=%lu "
-                        "draw=%lu tri=%lu pix=%lu vtx=%lu clip=%lu dl=%lu "
-                        "trunc=%lu copy=%lu fail=%lu self=%u mem2=%lu oom=%u "
+                        "draw=%lu tri=%lu pix=%lu/%lu xfb=%lu vtx=%lu clip=%lu dl=%lu "
+                        "trunc=%lu copy=%lu/%lu fail=%lu self=%u "
+                        "cw=%lu tx=%lu zr=%lu zm=%lX bm=%lX "
+                        "vc=%08lX tex=%06lX/%06lX td=%lu/%lu/%lu "
+                        "ts=%lux%lu>%lux%lu/%lu@%08lX "
+                        "tev=%lX/%lX/%lX/%lX ttev=%lX/%lX/%lX/%lX "
+                        "mem2=%lu oom=%u "
                         "dec=%08lX dirq=%lu msr=%08lX tb=%08lX:%08lX r13=%08lX "
+                        "gs=%08lX:%08lX/%08lX/%08lX/%08lX/%lu "
+                        "sn=%08lX:%08lX/%08lX/%08lX/%08lX/%lu/%08lX/%lu "
+                        "ax=%08lX/%lu/%08lX/%u w=%08lX:%08lX/%04lX/%08lX/%u,%08lX:%08lX/%04lX/%08lX/%u "
                         "rq=%08lX:%08lX v9=%08lX/%08lX last=%08lX/%08lX "
-                        "sc=%lu dsp=%lu lr=%08lX ctr=%08lX r31=%08lX "
+                        "sc=%lu cache=%lu cmp=%lu yz=%lu/%lu kp=%lu/%lu/%04lX dsp=%lu dm=%08lX/%lu/%lu dt=%08lX/%08lX "
+                        "lr=%08lX ctr=%08lX r31=%08lX "
+                        "cur=%08lX th=%08lX:%04lX/%08lX/%08lX/"
+                        "%08lX/%08lX/%08lX,"
+                        "%08lX:%04lX/%08lX/%08lX/%08lX/%08lX/%08lX,"
+                        "%08lX:%04lX/%08lX/%08lX/%08lX/%08lX/%08lX,"
+                        "%08lX:%04lX/%08lX/%08lX/%08lX/%08lX/%08lX "
                         "ipc=%lu ios=%lu@%08lX fd=%ld ret=%ld io=%08lX "
                         "bt=%04lX/%lu/%lu/%lu:%08lX "
                         "path=%s bad=%lu/%lu exi=%lu/%lu xcmd=%08lX xs=%u "
@@ -1223,13 +1889,41 @@ int main(void)
                         (unsigned long)gx->draw_calls,
                         (unsigned long)gx->triangles,
                         (unsigned long)gx->rasterized_pixels,
+                        (unsigned long)gx->colored_pixels,
+                        (unsigned long)gx->xfb_colored_pixels,
                         (unsigned long)gx->vertices,
                         (unsigned long)gx->clipped_vertices,
                         (unsigned long)gx->display_lists,
                         (unsigned long)gx->incomplete_commands,
                         (unsigned long)gx->efb_copies,
+                        (unsigned long)gx->xfb_copies,
                         (unsigned long)gx->decode_failures,
                         gx->geometry_self_test_passed ? 1u : 0u,
+                        (unsigned long)gx->color_write_draws,
+                        (unsigned long)gx->textured_draws,
+                        (unsigned long)gx->depth_rejected_pixels,
+                        (unsigned long)gx->last_z_mode,
+                        (unsigned long)gx->last_blend_mode,
+                        (unsigned long)gx->last_vertex_color,
+                        (unsigned long)gx->last_texture_image0,
+                        (unsigned long)gx->last_texture_image3,
+                        (unsigned long)gx->texture_decodes,
+                        (unsigned long)gx->texture_samples,
+                        (unsigned long)gx->unsupported_texture_formats,
+                        (unsigned long)gx->last_texture_width,
+                        (unsigned long)gx->last_texture_height,
+                        (unsigned long)gx->last_texture_storage_width,
+                        (unsigned long)gx->last_texture_storage_height,
+                        (unsigned long)gx->last_texture_format,
+                        (unsigned long)gx->last_texture_base,
+                        (unsigned long)gx->last_gen_mode,
+                        (unsigned long)gx->last_tev_order,
+                        (unsigned long)gx->last_tev_color_env,
+                        (unsigned long)gx->last_tev_alpha_env,
+                        (unsigned long)gx->textured_gen_mode,
+                        (unsigned long)gx->textured_tev_order,
+                        (unsigned long)gx->textured_tev_color_env,
+                        (unsigned long)gx->textured_tev_alpha_env,
                         (unsigned long)g_mem2_pages_used,
                         g_mem2_out_of_memory ? 1u : 0u,
                         (unsigned long)cpu.spr[22],
@@ -1238,6 +1932,34 @@ int main(void)
                         (unsigned long)(cpu.timebase >> 32),
                         (unsigned long)cpu.timebase,
                         (unsigned long)cpu.gpr[13],
+                        (unsigned long)game_system,
+                        (unsigned long)game_nerve,
+                        (unsigned long)game_nerve_vtable,
+                        (unsigned long)game_nerve_execute,
+                        (unsigned long)game_next_nerve,
+                        (unsigned long)game_nerve_step,
+                        (unsigned long)scene_controller,
+                        (unsigned long)scene_nerve,
+                        (unsigned long)scene_nerve_vtable,
+                        (unsigned long)scene_nerve_execute,
+                        (unsigned long)scene_next_nerve,
+                        (unsigned long)scene_nerve_step,
+                        (unsigned long)scene_object,
+                        (unsigned long)scene_init_state,
+                        (unsigned long)async_executor,
+                        (unsigned long)async_job_count,
+                        (unsigned long)async_job0,
+                        (unsigned int)async_job0_done,
+                        (unsigned long)async_worker0,
+                        (unsigned long)async_thread0,
+                        (unsigned long)async_thread0_state,
+                        (unsigned long)async_thread0_pc,
+                        (unsigned int)async_worker0_busy,
+                        (unsigned long)async_worker1,
+                        (unsigned long)async_thread1,
+                        (unsigned long)async_thread1_state,
+                        (unsigned long)async_thread1_pc,
+                        (unsigned int)async_worker1_busy,
                         (unsigned long)run_queue_addr,
                         (unsigned long)run_queue_bits,
                         (unsigned long)vector_900_0,
@@ -1245,10 +1967,51 @@ int main(void)
                         (unsigned long)g_last_mmio_read,
                         (unsigned long)g_last_mmio_write,
                         (unsigned long)g_system_calls,
+                        (unsigned long)g_cache_range_skips,
+                        (unsigned long)g_case_compare_fast_paths,
+                        (unsigned long)g_yaz0_fast_paths,
+                        (unsigned long)g_yaz0_fast_bytes,
+                        (unsigned long)g_kpad_reads,
+                        (unsigned long)g_kpad_samples,
+                        (unsigned long)g_kpad_previous_hold,
                         (unsigned long)g_dsp_status_reads,
+                        (unsigned long)g_dsp_from_mail,
+                        (unsigned long)g_dsp_ready_mails,
+                        (unsigned long)g_dsp_mail_reads,
+                        (unsigned long)g_dsp_to_mail,
+                        (unsigned long)g_dsp_boot_command,
                         (unsigned long)cpu.lr,
                         (unsigned long)cpu.ctr,
                         (unsigned long)cpu.gpr[31],
+                        (unsigned long)current_thread,
+                        (unsigned long)thread_ptrs[0],
+                        (unsigned long)thread_states[0],
+                        (unsigned long)thread_pcs[0],
+                        (unsigned long)thread_queues[0],
+                        (unsigned long)thread_callers[0][0],
+                        (unsigned long)thread_callers[0][1],
+                        (unsigned long)thread_callers[0][2],
+                        (unsigned long)thread_ptrs[1],
+                        (unsigned long)thread_states[1],
+                        (unsigned long)thread_pcs[1],
+                        (unsigned long)thread_queues[1],
+                        (unsigned long)thread_callers[1][0],
+                        (unsigned long)thread_callers[1][1],
+                        (unsigned long)thread_callers[1][2],
+                        (unsigned long)thread_ptrs[2],
+                        (unsigned long)thread_states[2],
+                        (unsigned long)thread_pcs[2],
+                        (unsigned long)thread_queues[2],
+                        (unsigned long)thread_callers[2][0],
+                        (unsigned long)thread_callers[2][1],
+                        (unsigned long)thread_callers[2][2],
+                        (unsigned long)thread_ptrs[3],
+                        (unsigned long)thread_states[3],
+                        (unsigned long)thread_pcs[3],
+                        (unsigned long)thread_queues[3],
+                        (unsigned long)thread_callers[3][0],
+                        (unsigned long)thread_callers[3][1],
+                        (unsigned long)thread_callers[3][2],
                         (unsigned long)g_ipc_requests,
                         (unsigned long)ios->last_ipc_command,
                         (unsigned long)ios->last_request,
@@ -1310,5 +2073,3 @@ int main(void)
     gfxExit();
     return 0;
 }
-
-
