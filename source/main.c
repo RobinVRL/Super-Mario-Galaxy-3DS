@@ -1504,6 +1504,8 @@ int main(void)
     const bool gpio_ok = smg3ds_hollywood_gpio_self_test();
     printf("MEM1 (24 MiB): %s\n", mem1_ok ? "ok" : "FAILED");
     printf("software rasterizer: %s\n", geometry_ok ? "geometry verified" : "FAILED");
+    printf("PICA200 presentation: %s\n",
+           initial_gx->pica200_available ? "active" : "CPU fallback");
     printf("EXI/RTC/SRAM: %s\n",
            exi_ok ? "transactions verified" : "FAILED");
     printf("Hollywood GPIO/I2C: %s\n",
@@ -2051,10 +2053,11 @@ int main(void)
                 advance_timebase(&cpu, frame_timebase_target - cpu.timebase);
         }
 #endif
-        smg3ds_gx_present_top();
-        gfxFlushBuffers();
-        gfxSwapBuffers();
-        gspWaitForVBlank();
+        if (!smg3ds_gx_present_top()) {
+            gfxFlushBuffers();
+            gfxSwapBuffers();
+            gspWaitForVBlank();
+        }
     }
 
 #ifdef SMG3DS_WITH_GENERATED
@@ -2069,6 +2072,7 @@ int main(void)
 #endif
     if (mem1_ok)
         cpu_free(&cpu);
+    smg3ds_gx_shutdown();
     mem2_free_sparse();
     gfxExit();
     return 0;

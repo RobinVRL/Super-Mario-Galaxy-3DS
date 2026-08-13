@@ -61,7 +61,7 @@ ARCH        := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 ASFLAGS     := -g $(ARCH)
 LDFLAGS     := -specs=3dsx.specs -g $(ARCH) \
                -Wl,-Map,$(TARGET).map,--gc-sections
-LIBS        := -lctru -lm
+LIBS        := -lcitro3d -lctru -lm
 LIBDIRS     := $(DEVKITPRO)/libctru
 
 APP_TITLE       := SMG3DS Bring-up
@@ -75,7 +75,8 @@ export DEPSDIR  := .
 CFILES           := $(foreach dir,$(SOURCE_DIRS),$(notdir $(wildcard $(dir)/*.c)))
 CPPFILES         := $(foreach dir,$(SOURCE_DIRS),$(notdir $(wildcard $(dir)/*.cpp)))
 SFILES           := $(foreach dir,$(SOURCE_DIRS),$(notdir $(wildcard $(dir)/*.s)))
-SOURCE_BASENAMES := $(CFILES) $(CPPFILES) $(SFILES)
+PICAFILES        := $(foreach dir,$(SOURCE_DIRS),$(notdir $(wildcard $(dir)/*.v.pica)))
+SOURCE_BASENAMES := $(CFILES) $(CPPFILES) $(SFILES) $(PICAFILES)
 ifneq ($(words $(SOURCE_BASENAMES)),$(words $(sort $(SOURCE_BASENAMES))))
 $(error "Two source files share a basename; the flat build object namespace would collide")
 endif
@@ -86,7 +87,9 @@ else
 export LD       := $(CXX)
 endif
 
-export OFILES   := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o) $(SFILES:.s=.o)
+export OFILES   := $(PICAFILES:.v.pica=.shbin.o) \
+                   $(CPPFILES:.cpp=.o) $(CFILES:.c=.o) $(SFILES:.s=.o)
+export HFILES   := $(PICAFILES:.v.pica=_shbin.h)
 export INCLUDE  := $(foreach dir,$(INCLUDE_DIRS),-I"$(dir)") \
                    $(foreach dir,$(LIBDIRS),-I"$(dir)/include") -I.
 CFLAGS      := -g -Wall -Wextra -O2 -mword-relocations \
@@ -109,6 +112,14 @@ clean:
 
 $(OUTPUT).3dsx: $(OUTPUT).elf $(_3DSXDEPS)
 $(OUTPUT).elf: $(OFILES)
+
+pica200_renderer.o: pica200_vshader_shbin.h
+
+.PRECIOUS: %.shbin
+
+%.shbin.o %_shbin.h: %.shbin
+	@echo $(notdir $<)
+	@$(bin2o)
 
 # Newlib defines uint32_t as unsigned long on ARM; upstream's diagnostics use
 # unsigned-int format specifiers. Keep project warnings enabled and isolate this

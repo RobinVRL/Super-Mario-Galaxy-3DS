@@ -52,13 +52,19 @@ typedef struct Smg3dsGxStats {
     uint32_t clipped_vertices;
     uint32_t decode_failures;
     uint32_t incomplete_commands;
+    uint32_t pica_presented_frames;
+    uint32_t pica_texture_uploads;
+    uint32_t pica_frame_failures;
+    uint64_t pica_uploaded_bytes;
     bool geometry_self_test_passed;
     bool video_started;
+    bool pica200_available;
 } Smg3dsGxStats;
 
 void smg3ds_gx_init(CPUState* cpu);
+void smg3ds_gx_shutdown(void);
 void smg3ds_gx_fifo_write(uint64_t value, uint8_t size);
 bool smg3ds_gx_take_finish_request(void);
-void smg3ds_gx_present_top(void);
+bool smg3ds_gx_present_top(void);
 const Smg3dsGxStats* smg3ds_gx_get_stats(void);
 

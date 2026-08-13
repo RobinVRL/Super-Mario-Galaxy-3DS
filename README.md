@@ -32,6 +32,8 @@ Implemented today:
 - EXI register handling with RTC/SRAM behavior, Hollywood GPIO/I2C state, VI/PI/IPC
   interrupts, the decrementer, timebase accounting, system calls, and FP-unavailable
   recovery.
+- A native DMP PICA200/Citro3D top-screen presenter with a PICA vertex shader,
+  native tiled RGBA8 upload, exact 2x sampling, and automatic CPU fallback.
 - An early GX FIFO decoder and software geometry rasterizer with EFB/XFB presentation.
 - Per-function native replacements through a fail-closed Petari/DolRecomp bridge. The
   first enabled replacement is `MR::isNearZero(float, float)` and is differentially
@@ -42,7 +44,7 @@ Major missing pieces:
 
 - Complete Wii OS, IOS, MMIO, and device behavior.
 - A production GX/TEV renderer: textures, materials, lighting, blending, depth behavior,
-  and many command/state paths remain incomplete.
+  direct PICA200 geometry submission, and many command/state paths remain incomplete.
 - Game input mapping beyond bring-up controls, DSP/audio output, save/NAND behavior,
   networking, and broad title compatibility.
 - Performance and memory work required for sustained gameplay on real New 3DS hardware.
@@ -61,7 +63,7 @@ DolRecomp generated C + Broadway CPUState
       +--> project-owned replacements / Petari ABI bridges
       +--> Wii memory, interrupts, EXI, GPIO, and IOS HLE
       +--> FST-backed reads from extracted disc files
-      +--> GX FIFO decoder -> software EFB/XFB -> 3DS top screen
+      +--> GX FIFO decoder -> software EFB/XFB -> PICA200 -> 3DS top screen
 ```
 
 DolRecomp is pinned to a private project fork because this target adds a configurable

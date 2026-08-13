@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "smg3ds/gx_renderer.h"
+#include "smg3ds/pica200_renderer.h"
 
 #include <math.h>
 #include <stddef.h>
@@ -1578,7 +1579,10 @@ void smg3ds_gx_init(CPUState* cpu)
     g_xf[0x1022] = 0x3f800000u;
     g_xf[0x1024] = 0x3f800000u;
     g_xf[0x1026] = 1u; /* orthographic until the game loads a projection */
+    g_stats.pica200_available = smg3ds_pica200_init();
 }
+
+void smg3ds_gx_shutdown(void) { smg3ds_pica200_shutdown(); }
 
 void smg3ds_gx_fifo_write(uint64_t value, uint8_t size)
 {
@@ -1604,19 +1608,42 @@ bool smg3ds_gx_take_finish_request(void)
     return requested;
 }
 
-void smg3ds_gx_present_top(void)
+bool smg3ds_gx_present_top(void)
 {
     uint16_t width;
     uint16_t height;
-    uint8_t* framebuffer = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &width, &height);
+    uint8_t* framebuffer;
     const uint32_t* source = g_xfb_valid ? g_xfb : g_efb;
+    const uint32_t clear = pack_rgba(g_clear_red, g_clear_green,
+                                     g_clear_blue, g_clear_alpha);
+    const Smg3dsPica200Stats* pica;
     uint16_t x;
     uint16_t y;
 
+    if (g_stats.pica200_available && smg3ds_pica200_present(
+            g_stats.video_started ? source : NULL,
+            GX_EFB_WIDTH, GX_EFB_HEIGHT, clear)) {
+        pica = smg3ds_pica200_get_stats();
+        g_stats.pica_presented_frames = pica->presented_frames;
+        g_stats.pica_texture_uploads = pica->texture_uploads;
+        g_stats.pica_frame_failures = pica->frame_failures;
+        g_stats.pica_uploaded_bytes = pica->uploaded_bytes;
+        g_stats.pica200_available = pica->available;
+        g_efb_dirty = false;
+        return true;
+    }
+    pica = smg3ds_pica200_get_stats();
+    g_stats.pica_presented_frames = pica->presented_frames;
+    g_stats.pica_texture_uploads = pica->texture_uploads;
+    g_stats.pica_frame_failures = pica->frame_failures;
+    g_stats.pica_uploaded_bytes = pica->uploaded_bytes;
+    g_stats.pica200_available = pica->available;
+
+    framebuffer = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &width, &height);
     if (framebuffer == NULL)
-        return;
+        return false;
     if (width == 0u || height == 0u)
-        return;
+        return false;
 
     if (source == NULL || (!g_efb_dirty && !g_stats.video_started)) {
         const size_t pixels = (size_t)width * (size_t)height;
@@ -1626,7 +1653,7 @@ void smg3ds_gx_present_top(void)
             framebuffer[i * 3u + 1u] = g_clear_green;
             framebuffer[i * 3u + 2u] = g_clear_red;
         }
-        return;
+        return false;
     }
 
     /*
@@ -1666,6 +1693,7 @@ void smg3ds_gx_present_top(void)
     }
 
     g_efb_dirty = false;
+    return false;
 }
 const Smg3dsGxStats* smg3ds_gx_get_stats(void)
 {
