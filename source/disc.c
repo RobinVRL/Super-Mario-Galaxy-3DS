@@ -14,7 +14,8 @@
 #define SMG3DS_FST_GUEST_TOP 0x817fc000u
 #define SMG3DS_FST_GUEST_MIN 0x81000000u
 #define SMG3DS_DISC_PATH_MAX 1024u
-#define SMG3DS_DISC_READ_BUFFER_SIZE (32u * 1024u)
+#define SMG3DS_DISC_READ_BUFFER_SIZE (64u * 1024u)
+#define SMG3DS_GUEST_COPY_PAGE_SIZE 4096u
 
 /* NTSC-U RVL SDK DVD filesystem globals in this title's DOL. */
 #define SMG3DS_DVD_CURRENT_DIRECTORY 0x806a2f08u
@@ -27,6 +28,7 @@ typedef struct Smg3dsDiscFile {
     u64 offset;
     u32 size;
     u32 fst_index;
+    bool host_validated;
 } Smg3dsDiscFile;
 
 static u8 g_disc_id[SMG3DS_DISC_ID_SIZE];
@@ -40,6 +42,9 @@ static u32 g_file_count;
 static char g_data_root[SMG3DS_DISC_PATH_MAX];
 static char g_last_error[256];
 static u8 g_read_buffer[SMG3DS_DISC_READ_BUFFER_SIZE];
+static FILE *g_cached_host_file;
+static u32 g_cached_host_file_index = UINT32_MAX;
+static u64 g_cached_host_file_position;
 static Smg3dsDiscStats g_stats;
 
 static void set_error(const char *format, ...)
@@ -91,6 +96,8 @@ static const char *fst_entry_name(u32 index)
 
 static void free_disc_state(void)
 {
+    if (g_cached_host_file != NULL)
+        fclose(g_cached_host_file);
     free(g_files);
     free(g_fst_parents);
     free(g_fst);
@@ -102,6 +109,9 @@ static void free_disc_state(void)
     g_fst_entry_count = 0u;
     g_fst_guest_address = 0u;
     g_file_count = 0u;
+    g_cached_host_file = NULL;
+    g_cached_host_file_index = UINT32_MAX;
+    g_cached_host_file_position = 0u;
     g_data_root[0] = '\0';
     g_stats.initialized = false;
     g_stats.file_count = 0u;
@@ -465,6 +475,7 @@ static bool parse_fst(void)
             g_files[file_position].offset = (u64)word_offset << 2;
             g_files[file_position].size = disc_read_be32(entry + 8u);
             g_files[file_position].fst_index = index;
+            g_files[file_position].host_validated = false;
             ++file_position;
         }
     }
@@ -551,6 +562,53 @@ static bool format_host_path(u32 file_index,
     }
 
     return true;
+}
+
+static FILE *open_cached_host_file(u32 file_index, u64 position,
+                                   char *host_path, size_t path_size)
+{
+    static const char read_mode[] = {'r', 'b', 0};
+    Smg3dsDiscFile *file;
+
+    if (file_index >= g_file_count || position > (u64)LONG_MAX ||
+        !format_host_path(file_index, host_path, path_size))
+        return NULL;
+    file = &g_files[file_index];
+    if (g_cached_host_file == NULL ||
+        g_cached_host_file_index != file_index) {
+        long host_length;
+
+        if (g_cached_host_file != NULL)
+            fclose(g_cached_host_file);
+        g_cached_host_file = fopen(host_path, read_mode);
+        g_cached_host_file_index = UINT32_MAX;
+        g_cached_host_file_position = 0u;
+        if (g_cached_host_file == NULL) {
+            set_error("Extracted disc file is missing: %s", host_path);
+            return NULL;
+        }
+        setvbuf(g_cached_host_file, NULL, _IOFBF,
+                SMG3DS_DISC_READ_BUFFER_SIZE);
+        if (!file->host_validated) {
+            if (file->size > (u32)LONG_MAX ||
+                fseek(g_cached_host_file, 0, SEEK_END) != 0 ||
+                (host_length = ftell(g_cached_host_file)) < 0 ||
+                (unsigned long)host_length < (unsigned long)file->size) {
+                fclose(g_cached_host_file);
+                g_cached_host_file = NULL;
+                return NULL;
+            }
+            file->host_validated = true;
+            g_cached_host_file_position = (u64)(unsigned long)host_length;
+        }
+        g_cached_host_file_index = file_index;
+    }
+    if (g_cached_host_file_position != position) {
+        if (fseek(g_cached_host_file, (long)position, SEEK_SET) != 0)
+            return NULL;
+        g_cached_host_file_position = position;
+    }
+    return g_cached_host_file;
 }
 
 static bool find_file_at_offset(u64 offset, u32 *file_index)
@@ -670,27 +728,11 @@ static bool validate_host_files(u64 offset, u32 length)
         if (file_index != previous_file_index) {
             char host_path[SMG3DS_DISC_PATH_MAX];
             FILE *host_file;
-            long host_length;
 
-            if (!format_host_path(file_index, host_path, sizeof(host_path))) {
+            host_file = open_cached_host_file(
+                file_index, 0u, host_path, sizeof(host_path));
+            if (host_file == NULL)
                 return false;
-            }
-
-            host_file = fopen(host_path, "rb");
-            if (host_file == NULL) {
-                set_error("Extracted disc file is missing: %s", host_path);
-                return false;
-            }
-            if (file->size > (u32)LONG_MAX ||
-                fseek(host_file, 0, SEEK_END) != 0 ||
-                (host_length = ftell(host_file)) < 0 ||
-                (unsigned long)host_length < (unsigned long)file->size) {
-                fclose(host_file);
-                set_error("Extracted disc file is shorter than its FST entry: %s",
-                          host_path);
-                return false;
-            }
-            fclose(host_file);
             previous_file_index = file_index;
         }
 
@@ -706,10 +748,40 @@ static void write_guest_bytes(CPUState *cpu,
                               const u8 *data,
                               size_t length)
 {
-    size_t position;
+    size_t position = 0u;
 
-    for (position = 0u; position < length; ++position) {
-        mem_write8(cpu, guest_address + (u32)position, data[position]);
+    while (position < length) {
+        const u32 address = guest_address + (u32)position;
+        const size_t page_remaining =
+            SMG3DS_GUEST_COPY_PAGE_SIZE -
+            (address & (SMG3DS_GUEST_COPY_PAGE_SIZE - 1u));
+        const size_t chunk = length - position < page_remaining ?
+                             length - position : page_remaining;
+        u8 *destination = ppc_memory_pointer(
+            cpu, address, (u32)chunk);
+        size_t copied = 0u;
+
+        if (destination != NULL) {
+            memcpy(destination, data + position, chunk);
+            position += chunk;
+            continue;
+        }
+        while (chunk - copied >= 8u) {
+            const u8 *source = data + position + copied;
+            const u64 value =
+                ((u64)source[0] << 56u) | ((u64)source[1] << 48u) |
+                ((u64)source[2] << 40u) | ((u64)source[3] << 32u) |
+                ((u64)source[4] << 24u) | ((u64)source[5] << 16u) |
+                ((u64)source[6] << 8u) | (u64)source[7];
+            mem_write64(cpu, address + (u32)copied, value);
+            copied += 8u;
+        }
+        while (copied < chunk) {
+            mem_write8(cpu, address + (u32)copied,
+                       data[position + copied]);
+            ++copied;
+        }
+        position += chunk;
     }
 }
 
@@ -780,12 +852,9 @@ static bool stream_disc_range(CPUState *cpu,
             return false;
         }
 
-        host_file = fopen(host_path, "rb");
-        if (host_file == NULL ||
-            fseek(host_file, (long)file_position, SEEK_SET) != 0) {
-            if (host_file != NULL) {
-                fclose(host_file);
-            }
+        host_file = open_cached_host_file(
+            file_index, file_position, host_path, sizeof(host_path));
+        if (host_file == NULL) {
             set_error("Could not seek extracted disc file: %s", host_path);
             return false;
         }
@@ -799,10 +868,11 @@ static bool stream_disc_range(CPUState *cpu,
                              : sizeof(g_read_buffer);
             count = fread(g_read_buffer, 1u, chunk_size, host_file);
             if (count != chunk_size) {
-                fclose(host_file);
                 set_error("Short read from extracted disc file: %s", host_path);
                 return false;
             }
+
+            g_cached_host_file_position += (u64)count;
 
             write_guest_bytes(cpu, guest_position, g_read_buffer, chunk_size);
             guest_position += (u32)chunk_size;
@@ -811,7 +881,6 @@ static bool stream_disc_range(CPUState *cpu,
             segment_size -= (u64)chunk_size;
         }
 
-        fclose(host_file);
     }
 
     return true;

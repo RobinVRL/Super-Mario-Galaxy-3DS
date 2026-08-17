@@ -46,7 +46,15 @@
 #ifndef DOLRECOMP_FORCE_DISPATCH
 #define DOLRECOMP_FORCE_DISPATCH(CANDIDATE)                             \
     (0 SMG3DS_PETARI_OVERRIDES(                                        \
-        SMG3DS_PETARI_FORCE_DISPATCH_ENTRY, (CANDIDATE)))
+        SMG3DS_PETARI_FORCE_DISPATCH_ENTRY, (CANDIDATE))                \
+     || (CANDIDATE) == 0x803936BCu                                     \
+     || (CANDIDATE) == 0x80397A38u                                     \
+     || (CANDIDATE) == 0x80397A84u                                     \
+     || (CANDIDATE) == 0x80398070u                                     \
+     || (CANDIDATE) == 0x80398090u                                     \
+     || (CANDIDATE) == 0x803980A0u                                     \
+     || (CANDIDATE) == 0x803991ACu                                     \
+     || (CANDIDATE) == 0x803FD4C8u)
 #endif
 
 #endif /* SMG3DS_PETARI_OVERRIDES_H */

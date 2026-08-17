@@ -212,9 +212,28 @@ try {
     $env:PATH = "$msysBin;$originalPath"
 
     Write-Host "Building in isolated staging tree: $stage"
-    & $make '-C' $buildDir '-f' '../Makefile' 'TOPDIR=..' "-j$Jobs"
+    & $make '-C' $buildDir '-f' '../Makefile' 'TOPDIR=..' "-j$Jobs" 'smg3ds-bringup.elf'
     if ($LASTEXITCODE -ne 0) {
-        throw "3DS build failed with exit code $LASTEXITCODE"
+        throw "3DS ELF build failed with exit code $LASTEXITCODE"
+    }
+
+    # The generated translation carries enough DWARF data to push the ELF file
+    # itself beyond 3dsxtool's 256 MiB input limit, even though the loadable
+    # image is much smaller. Keep the linker map for diagnostics and discard
+    # only debug sections before packaging.
+    $strip = Join-Path $devkitProWindows 'devkitARM\bin\arm-none-eabi-strip.exe'
+    if (-not (Test-Path -LiteralPath $strip -PathType Leaf)) {
+        throw "ARM strip tool was not found at: $strip"
+    }
+    $elf = Join-Path $buildDir 'smg3ds-bringup.elf'
+    & $strip '--strip-debug' $elf
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not strip 3DS ELF debug sections (exit code $LASTEXITCODE)"
+    }
+
+    & $make '-C' $buildDir '-f' '../Makefile' 'TOPDIR=..' "-j$Jobs" 'smg3ds-bringup.3dsx'
+    if ($LASTEXITCODE -ne 0) {
+        throw "3DS packaging failed with exit code $LASTEXITCODE"
     }
 
     foreach ($extension in @('3dsx', 'elf', 'map', 'smdh', 'lst')) {
