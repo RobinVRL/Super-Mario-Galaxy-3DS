@@ -1,4 +1,5 @@
 # Super Mario Galaxy 3DS
+### This project contains major AI usage, through Codex primarily.
 
 An experimental static-recompilation bring-up of **Super Mario Galaxy (NTSC-U,
 RMGE01)** for New Nintendo 3DS hardware and the Azahar emulator.
