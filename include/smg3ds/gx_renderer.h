@@ -55,6 +55,9 @@ typedef struct Smg3dsGxStats {
     uint32_t pica_presented_frames;
     uint32_t pica_texture_uploads;
     uint32_t pica_frame_failures;
+    uint64_t raster_ticks;
+    uint64_t efb_copy_ticks;
+    uint64_t present_ticks;
     uint64_t pica_uploaded_bytes;
     bool geometry_self_test_passed;
     bool video_started;
@@ -66,5 +69,6 @@ void smg3ds_gx_shutdown(void);
 void smg3ds_gx_fifo_write(uint64_t value, uint8_t size);
 bool smg3ds_gx_take_finish_request(void);
 bool smg3ds_gx_present_top(void);
+void smg3ds_gx_present_bottom(uint16_t touch_x, uint16_t touch_y,
+                              bool touch_active);
 const Smg3dsGxStats* smg3ds_gx_get_stats(void);
-

@@ -17,35 +17,52 @@ extracted NTSC-U disc.
 
 The project can configure and compile the retail RMGE01 DOL into a `.3dsx`, load its
 MEM1/MEM2 sections, index extracted disc assets, initialize the minimum Wii boot state,
-and execute generated blocks under a bounded frame loop. It is instrumented as a
-bring-up environment: the bottom screen reports CPU, interrupt, MMIO, IOS, EXI, disc,
-and GX activity while the top screen receives the current software-rendered framebuffer.
+and execute generated blocks under a host-time-bounded frame loop. It is instrumented as
+a bring-up environment: the bottom screen reports CPU, interrupt, MMIO, IOS, input,
+disc, and GX activity while the top screen receives the current software-rendered Wii
+framebuffer.
+
+The current runtime advances through the game's early boot and asynchronous archive
+loading paths and can render early GX output. Work is concentrated around the file-select
+and scene-startup path: archive lifetime, resource lookup, scene-wipe creation, and the
+remaining GX state needed by those screens. This is still an engineering milestone, not
+a stable menu or playable game.
 
 Implemented today:
 
-- DolRecomp's generated C backend and matching portable Broadway CPU state.
-- 24 MiB MEM1 plus sparse, on-demand 64 MiB MEM2 with big-endian guest access.
+- DolRecomp's generated C backend and matching portable Broadway CPU state, including a
+  generated-code memory fast path for ordinary MEM1 and cached sparse-MEM2 accesses.
+- 24 MiB MEM1 plus sparse, on-demand 64 MiB MEM2, big-endian guest access, and a host
+  paging path for the constrained New 3DS address space.
 - Retail DOL loading, Wii low-memory values, region settings, and boot metadata.
-- FST-indexed disc access backed by extracted files on SD/Azahar storage.
+- FST-indexed disc access backed by extracted files on SD/Azahar storage, with cached
+  streaming reads and SDK file-info/path helpers for the asynchronous loader.
 - A focused IOS IPC layer for the services reached so far, including `/dev/di`,
-  `/dev/stm/*`, and the title's early USB request path.
+  `/dev/stm/*`, `/dev/fs`, the title's Bluetooth USB path, deferred event-hook replies,
+  and private title-scoped NAND/save-file emulation on SD.
 - EXI register handling with RTC/SRAM behavior, Hollywood GPIO/I2C state, VI/PI/IPC
   interrupts, the decrementer, timebase accounting, system calls, and FP-unavailable
   recovery.
 - A native DMP PICA200/Citro3D top-screen presenter with a PICA vertex shader,
-  native tiled RGBA8 upload, exact 2x sampling, and automatic CPU fallback.
-- An early GX FIFO decoder and software geometry rasterizer with EFB/XFB presentation.
+  tiled RGBA8 texture upload, nearest-neighbor scaling, and automatic CPU fallback.
+- A software GX pipeline covering FIFO/display-list decoding, indexed vertex arrays,
+  position and texture transforms, tiled texture and TLUT decoding, multi-stage TEV,
+  alpha/depth/blend tests, EFB texture captures, XFB copies, and triangle rasterization.
+- A Wii Remote/Nunchuk bridge for 3DS buttons, Circle Pad movement, touchscreen IR
+  pointing/clicking, and a bring-up shake gesture.
 - Per-function native replacements through a fail-closed Petari/DolRecomp bridge. The
   first enabled replacement is `MR::isNearZero(float, float)` and is differentially
   tested against the retained generated body.
-- Runtime fault logging to `sdmc:/smg3ds-runtime.log`.
+- Targeted, fail-closed compatibility repairs for the retail FileRipper, archive,
+  resource-table, asynchronous-loader, and scene-wipe paths reached by the current
+  milestone.
 
 Major missing pieces:
 
 - Complete Wii OS, IOS, MMIO, and device behavior.
-- A production GX/TEV renderer: textures, materials, lighting, blending, depth behavior,
-  direct PICA200 geometry submission, and many command/state paths remain incomplete.
-- Game input mapping beyond bring-up controls, DSP/audio output, save/NAND behavior,
+- A production GX/TEV renderer: lighting, indirect texturing, many texture/state paths,
+  exact copy/filter behavior, and direct PICA200 geometry submission remain incomplete.
+- Accurate motion/IR behavior, DSP/audio output, complete NAND/save semantics,
   networking, and broad title compatibility.
 - Performance and memory work required for sustained gameplay on real New 3DS hardware.
 
@@ -63,6 +80,7 @@ DolRecomp generated C + Broadway CPUState
       +--> project-owned replacements / Petari ABI bridges
       +--> Wii memory, interrupts, EXI, GPIO, and IOS HLE
       +--> FST-backed reads from extracted disc files
+      +--> 3DS HID -> emulated Wii Remote, Nunchuk, and IR pointer
       +--> GX FIFO decoder -> software EFB/XFB -> PICA200 -> 3DS top screen
 ```
 
@@ -160,12 +178,24 @@ your local ignored `romfs/game` configuration.
 
 Runtime controls:
 
-- `A`: pause or resume PPC execution.
-- `START`: exit.
+| 3DS input | Emulated Wii input |
+| --- | --- |
+| Circle Pad | Nunchuk stick |
+| D-Pad | Wii Remote D-Pad |
+| `A` | `A` |
+| `B` | `B` |
+| `X` | `1` plus a shake/spin gesture |
+| `Y` | `2` |
+| `START` | `+` |
+| `SELECT` | `-` |
+| `L` / `ZL` | Nunchuk `Z` |
+| `R` / `ZR` | Nunchuk `C` |
+| Touchscreen game view | IR pointer; holding the point also produces `A` after capture |
 
-When every startup check passes, PPC execution starts automatically. A fault pauses
-execution and records detailed state on the debug console and in
-`sdmc:/smg3ds-runtime.log`.
+When every startup check passes, PPC execution starts automatically. There is currently
+no pause toggle; use the system HOME flow or stop emulation to leave the runtime. A guest
+panic or host-side fault stops PPC execution and leaves detailed state on the bottom
+screen for diagnosis.
 
 ## Validation
 
@@ -178,7 +208,8 @@ Run the focused native-replacement checks with:
 
 The differential test covers normal values, signed zero, boundary values, infinities,
 NaN, return state, exception state, and generated cycle accounting. The regular
-incremental build runs the broader project preflight.
+incremental build runs the broader project preflight, including software-rasterizer,
+EFB-copy, EXI, GPIO, IOS/deferred-reply, disc-streaming, and timebase checks.
 
 ## Repository layout
 

@@ -24,6 +24,9 @@ typedef struct Smg3dsIosStats {
     u32 ioctlv_requests;
     u32 invalid_requests;
     u32 unknown_requests;
+    u32 last_unknown_ipc_command;
+    s32 last_unknown_fd;
+    u32 last_unknown_ioctl_request;
 
     u32 stm_eventhooks_parked;
     u32 stm_eventhooks_released;

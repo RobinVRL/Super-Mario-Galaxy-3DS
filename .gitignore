@@ -1,6 +1,10 @@
 /build/
 /extracted/
 /*.3dsx
+/*.cia
+/_diagnostics/
+/artifacts/
+/smg3ds-frame-sheet.jpg
 /*.elf
 /*.map
 /*.smdh

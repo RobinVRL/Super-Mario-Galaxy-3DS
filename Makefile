@@ -31,6 +31,7 @@ GENERATED_C         := $(GENERATED_DIR)/generated.c
 GENERATED_H         := $(GENERATED_DIR)/generated.h
 GENERATED_CHUNK_DIR := $(GENERATED_DIR)/generated_chunks
 GENERATED_ACTUAL_CHUNKS := $(sort $(notdir $(wildcard $(GENERATED_CHUNK_DIR)/*.c)))
+GENERATED_OFILES := $(GENERATED_ACTUAL_CHUNKS:.c=.o)
 GENERATED_ANY := $(strip $(wildcard $(GENERATED_C)) \
                           $(wildcard $(GENERATED_H)) \
                           $(GENERATED_ACTUAL_CHUNKS))
@@ -95,7 +96,8 @@ export INCLUDE  := $(foreach dir,$(INCLUDE_DIRS),-I"$(dir)") \
 CFLAGS      := -g -Wall -Wextra -O2 -mword-relocations \
                -ffunction-sections -fdata-sections $(ARCH) \
                $(INCLUDE) -include smg3ds/petari_overrides.h \
-               -D__3DS__ $(GENERATED_DEFINE)
+               -D__3DS__ -DDOLRECOMP_C_LOOP_CYCLE_BUDGET=1024 \
+               $(GENERATED_DEFINE)
 CXXFLAGS    := $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++17
 export LIBPATHS := $(foreach dir,$(LIBDIRS),-L"$(dir)/lib")
 export _3DSXDEPS := $(OUTPUT).smdh
@@ -121,9 +123,16 @@ pica200_renderer.o: pica200_vshader_shbin.h
 	@echo $(notdir $<)
 	@$(bin2o)
 
+# Compiler flags materially affect generated-code scheduling. Keep the
+# persistent incremental cache correct when this Makefile changes.
+$(OFILES): $(TOPDIR)/Makefile
+
 # Newlib defines uint32_t as unsigned long on ARM; upstream's diagnostics use
 # unsigned-int format specifiers. Keep project warnings enabled and isolate this
 # harmless upstream-only warning to its object.
-cpu.o: CFLAGS += -Wno-format
+cpu.o: CFLAGS += -Wno-format -O3
+gx_renderer.o main.o: CFLAGS += -O3 -fno-math-errno
+$(GENERATED_OFILES): CFLAGS += -fno-math-errno \
+                              -DDOLRECOMP_GENERATED_FAST_MEMORY=1
 
 -include *.d

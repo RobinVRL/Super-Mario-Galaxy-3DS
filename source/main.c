@@ -14,6 +14,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * The generated ARM code is large enough that libctru's automatic split would
+ * leave only its 24 MiB minimum normal heap. Reserve enough normal heap for
+ * the standard 24 MiB guest MEM1 plus host allocation overhead, and let libctru
+ * assign every remaining New 3DS application-memory byte to sparse MEM2.
+ */
+u32 __ctru_heap_size = 32u * 1024u * 1024u;
+u32 __ctru_linear_heap_size = 0u;
+
 #ifdef SMG3DS_WITH_GENERATED
 #define DOLRECOMP_CPU_HEADER "cpu/cpu.h"
 #define DOLRECOMP_ENABLE_REPLACEMENTS 1
@@ -25,9 +34,11 @@ enum {
     SMG3DS_MEM2_PAGE_SHIFT = 12,
     SMG3DS_MEM2_PAGE_SIZE = 1 << SMG3DS_MEM2_PAGE_SHIFT,
     SMG3DS_MEM2_PAGE_COUNT = SMG3DS_MEM2_SIZE / SMG3DS_MEM2_PAGE_SIZE,
+    SMG3DS_MEM2_SWAP_SLOT_NONE = 0xffff,
     SMG3DS_MAX_DISPATCHES_PER_FRAME = 4096,
+    SMG3DS_DISPATCH_BATCH_BLOCKS = 4,
+    SMG3DS_HOST_TIME_CHECK_INTERVAL = 8,
     SMG3DS_CPU_SLICE_MILLISECONDS = 12,
-    SMG3DS_DEBUG_LOG_FRAMES = 30,
     SMG3DS_TIMEBASE_PER_FRAME = 1012500,
     SMG3DS_TIMEBASE_FREQUENCY = 60750000,
     SMG3DS_BROADWAY_CYCLES_PER_TIMEBASE_TICK = 12,
@@ -55,17 +66,30 @@ static uint32_t g_kpad_reads;
 static uint32_t g_kpad_samples;
 static u32 g_host_keys_held;
 static u32 g_host_keys_latched_down;
+static bool g_emulated_ir_connected = true;
 static circlePosition g_host_circle;
 static touchPosition g_host_touch;
 static bool g_host_touch_active;
+static bool g_host_pointer_active;
+static bool g_host_touch_click_ready;
 static u32 g_kpad_previous_hold;
 static bool g_kpad_shake_phase;
-static uint32_t g_debug_frames;
 static uint32_t g_fault_raw;
 static uint32_t g_fault_cia;
 static uint8_t g_mmio_shadow[0x10000];
 static uint8_t* g_mem2_pages[SMG3DS_MEM2_PAGE_COUNT];
+static bool g_mem2_pages_normal[SMG3DS_MEM2_PAGE_COUNT];
+static bool g_mem2_pages_dirty[SMG3DS_MEM2_PAGE_COUNT];
+static uint16_t g_mem2_swap_slots[SMG3DS_MEM2_PAGE_COUNT];
+static uint32_t g_mem2_page_last_use[SMG3DS_MEM2_PAGE_COUNT];
+static FILE* g_mem2_swap_file;
+static uint32_t g_mem2_page_clock;
 static uint32_t g_mem2_pages_used;
+static uint32_t g_mem2_pages_reclaimed;
+static uint32_t g_mem2_pages_evicted;
+static uint32_t g_mem2_pages_loaded;
+static uint32_t g_mem2_swap_slots_used;
+static uint32_t g_mem2_swap_failures;
 static bool g_mem2_out_of_memory;
 static uint16_t g_dsp_control = 0x0804u;
 static uint16_t g_dsp_hardware_status;
@@ -90,6 +114,7 @@ static uint32_t g_pi_cause;
 static uint32_t g_pi_mask;
 static uint32_t g_vi_retraces;
 static bool g_vi_demand_pacing;
+static bool g_vi_background_handoff_attempted;
 static uint32_t g_external_interrupts;
 static uint32_t g_decrementer_interrupts;
 static bool g_decrementer_armed;
@@ -98,7 +123,111 @@ static uint32_t g_timebase_cycle_remainder;
 static uint32_t g_ai_control;
 static uint32_t g_ai_sample_count;
 static u64 g_ai_sample_timebase;
-static FILE* g_debug_file = NULL;
+static FILE* const g_debug_file = NULL;
+static char g_fault_message[4096];
+static char g_last_stage_archive[96] = "-";
+static uint32_t g_stage_archive_requests;
+static uint32_t g_file_select_receives;
+static u32 g_file_select_request_info;
+static u32 g_file_select_entry;
+static u32 g_file_select_context_before;
+static u32 g_file_select_state_before;
+static u32 g_file_select_queue_before;
+static u32 g_file_select_set_context;
+static uint32_t g_file_select_set_calls;
+static u32 g_file_select_context_after;
+static u32 g_file_select_state_after;
+static u32 g_file_select_queue_after;
+static uint32_t g_file_select_wait_repairs;
+static uint32_t g_file_holder_null_wait_retries;
+static u32 g_file_holder_null_wait_lr;
+static bool g_file_holder_retry_pending;
+static u32 g_file_holder_retry_thread;
+static u32 g_file_holder_retry_return;
+static u32 g_file_holder_retry_loader;
+static u32 g_file_holder_retry_path;
+static uint32_t g_archive_receive_preflight_retries;
+static u32 g_archive_receive_priority_state;
+static u32 g_archive_receive_thread;
+static u32 g_archive_receive_original_priority;
+static u32 g_archive_receive_loader;
+static u32 g_archive_receive_path;
+static u32 g_archive_receive_return;
+static bool g_archive_repair_send_pending;
+static u32 g_archive_repair_info;
+static u32 g_archive_repair_file_entry;
+static uint32_t g_archive_repair_submissions;
+static bool g_archive_rebuild_pending;
+static u32 g_archive_rebuild_thread;
+static uint32_t g_archive_rebuild_attempts;
+static u32 g_archive_rebuild_orphan_index;
+static u32 g_archive_rebuild_file_count;
+static u32 g_archive_rebuild_heap;
+static u32 g_archive_holder_rebuild_state;
+static u32 g_archive_holder_rebuild_thread;
+static uint32_t g_archive_holder_rebuild_attempts;
+static u32 g_archive_holder_before;
+static u32 g_archive_holder_after;
+static u32 g_archive_holder_vector;
+static u32 g_archive_holder_capacity;
+static u32 g_archive_holder_count;
+static uint32_t g_archive_holder_lookup_fast_paths;
+static uint32_t g_archive_holder_lookup_hits;
+static uint32_t g_archive_holder_invalid_entries;
+static uint32_t g_file_loader_identity_repairs;
+static char g_archive_recovery_path[96];
+static uint32_t g_audio_resource_skips;
+static u32 g_audio_resource_bad_pointer;
+static u32 g_audio_resource_bad_count;
+static uint32_t g_collision_zone_duplicate_skips;
+static uint32_t g_collision_zone_capacity_skips;
+static uint32_t g_collision_zone_count_repairs;
+static uint32_t g_collision_zone_max_parts;
+static bool g_zone_count_query_pending;
+static u32 g_zone_count_query_thread;
+static u32 g_zone_count_query_return;
+static uint32_t g_zone_count_minimum_repairs;
+static uint32_t g_zone_count_maximum_repairs;
+static bool g_archive_wait_redirect_pending;
+static u32 g_archive_wait_redirect_thread;
+static u32 g_archive_wait_redirect_loader;
+static u32 g_archive_wait_redirect_path;
+static uint32_t g_archive_wait_redirects;
+static uint32_t g_file_wait_calls;
+static uint32_t g_file_wait_ready_bypasses;
+static uint32_t g_file_wait_mounted_bypasses;
+static uint32_t g_file_wait_invalid_repairs;
+static u32 g_file_wait_entry;
+static u32 g_file_wait_state;
+static u32 g_file_wait_context;
+static u32 g_file_wait_lr;
+static char g_file_wait_path[96];
+static bool g_file_wait_reentry_pending;
+static u32 g_file_wait_reentry_thread;
+static u32 g_file_wait_reentry_loader;
+static u32 g_file_wait_reentry_path;
+static u32 g_file_wait_reconciled_entry;
+static uint32_t g_async_wait_missing_bypasses;
+static u32 g_async_wait_missing_executor;
+static u32 g_async_wait_missing_name;
+static uint32_t g_receive_archive_false_hits;
+static u32 g_receive_archive_false_result;
+static uint32_t g_receive_archive_identity_repairs;
+static u32 g_receive_archive_stale_result;
+static u32 g_receive_archive_canonical_result;
+static bool g_scene_wipe_create_pending;
+static u32 g_scene_wipe_create_thread;
+static u32 g_scene_wipe_saved_name;
+static u32 g_scene_wipe_saved_return;
+static uint32_t g_scene_wipe_create_attempts;
+static uint32_t g_scene_wipe_create_failures;
+static bool g_system_wipe_create_pending;
+static u32 g_system_wipe_create_thread;
+static u32 g_system_wipe_saved_return;
+static uint32_t g_system_wipe_create_attempts;
+static uint32_t g_system_wipe_create_failures;
+static bool g_ptr_array_count_reported;
+static bool g_resource_table_null_reported;
 
 enum {
     SMG3DS_IPC_IRQ = 0x40000000u,
@@ -134,9 +263,53 @@ enum {
     SMG3DS_FILE_RIPPER_EXISTS_CALL = 0x80398654u,
     SMG3DS_FILE_RIPPER_EXISTS_RETURN = 0x8039865cu,
     SMG3DS_SETUP_RSO_HOME_BUTTON_MENU = 0x803ACA54u,
-    SMG3DS_MR_IS_EQUAL_STRING_CASE = 0x803FD4C8u,
     SMG3DS_FILE_RIPPER_YAZ0_LOOP = 0x80398A20u,
     SMG3DS_FILE_RIPPER_YAZ0_EPILOGUE = 0x80398AECu,
+    SMG3DS_FILE_HOLDER_WAIT_READ_DONE = 0x80397A38u,
+    SMG3DS_FILE_HOLDER_SET_CONTEXT = 0x80397A84u,
+    SMG3DS_FILE_LOADER_REQUEST_MOUNT_ARCHIVE = 0x80397F7Cu,
+    SMG3DS_FILE_LOADER_RECEIVE_FILE = 0x80398070u,
+    SMG3DS_FILE_LOADER_RECEIVE_INFO_RETURN = 0x80398090u,
+    SMG3DS_FILE_LOADER_RECEIVE_WAIT_RETURN = 0x803980A0u,
+    SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE = 0x803980C4u,
+    SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE_WAIT_RETURN = 0x803980F4u,
+    SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE_LOOKUP_RETURN = 0x80398100u,
+    SMG3DS_FILE_LOADER_RECEIVE_ALL = 0x80398118u,
+    SMG3DS_FILE_LOADER_RECEIVE_ALL_WAIT_RETURN = 0x8039814Cu,
+    SMG3DS_FILE_LOADER_GET_MOUNTED_ARCHIVE_AND_HEAP = 0x803981A0u,
+    SMG3DS_FILE_LOADER_GET_REQUEST_INFO = 0x80398260u,
+    SMG3DS_ARCHIVE_HOLDER_CTOR = 0x80394778u,
+    SMG3DS_ARCHIVE_HOLDER_FIND_ENTRY = 0x803949F0u,
+    SMG3DS_LAYOUT_MANAGER_AFTER_NAME_FORMAT = 0x80367F9Cu,
+    SMG3DS_RECEIVE_ARCHIVE_WRAPPER_RETURN = 0x803CE014u,
+    SMG3DS_MOUNTED_ARCHIVE_WRAPPER_RETURN = 0x803CE0C4u,
+    SMG3DS_FUNCTION_ASYNC_WAIT_NOT_FOUND = 0x803991ACu,
+    SMG3DS_FUNCTION_ASYNC_WAIT_EPILOGUE = 0x80399268u,
+    SMG3DS_AUDIO_GROUP_RESOURCE_SETTER = 0x800310A4u,
+    SMG3DS_AUDIO_ME_RESOURCE_SETTER = 0x8031B484u,
+    SMG3DS_ARCHIVE_REBUILD_RETURN = 0x803936BCu,
+    SMG3DS_AUDIO_SEQUENCE_RESOURCE_SETTER = 0x803936BCu,
+    SMG3DS_AUDIO_SEQUENCE_RESOURCE_LOOKUP_RETURN = 0x8039378Cu,
+    SMG3DS_STRCASECMP = 0x803FD4C8u,
+    SMG3DS_CREATE_SCENE_OBJ = 0x80344A74u,
+    SMG3DS_SCENE_WIPE_FORCE_OPEN = 0x8037EE88u,
+    SMG3DS_SCENE_WIPE_OBJ_ID = 0x22u,
+    SMG3DS_CREATE_SYSTEM_WIPE_HOLDER = 0x8038C89Cu,
+    SMG3DS_SYSTEM_WIPE_REQUIRED = 0x803F718Cu,
+    SMG3DS_STAGE_ARCHIVE_LOOKUP_RETURN = 0x8034670Cu,
+    SMG3DS_STAGE_ARCHIVE_LOOKUP = 0x803F5F34u,
+    SMG3DS_OPERATOR_NEW = 0x80409AF8u,
+    SMG3DS_PTR_ARRAY_FIND_LOOP = 0x80404AE8u,
+    SMG3DS_PTR_ARRAY_FIND_NOT_FOUND = 0x80404B10u,
+    SMG3DS_RESOURCE_TABLE_FIND_LOOP = 0x803A74C8u,
+    SMG3DS_COLLISION_ZONE_ADD_PARTS = 0x80174800u,
+    SMG3DS_GET_STAGE_ZONE_COUNT = 0x803F6204u,
+    SMG3DS_RESOURCE_TABLE_FIND_NOT_FOUND = 0x803A74F0u,
+    SMG3DS_OS_YIELD_THREAD = 0x804AB44Cu,
+    SMG3DS_OS_SET_THREAD_PRIORITY = 0x804AC19Cu,
+    SMG3DS_OS_SEND_MESSAGE = 0x804A88E4u,
+    SMG3DS_OS_UNLOCK_MUTEX = 0x804A9548u,
+    SMG3DS_FUNCTION_ASYNC_MUTEX = 0x805F6998u,
     SMG3DS_KPAD_READ = 0x804506D8u,
     SMG3DS_CACHE_RANGE_BEGIN = 0x804A2F20u,
     SMG3DS_CACHE_RANGE_END = 0x804A2FD4u,
@@ -155,7 +328,14 @@ enum {
     SMG3DS_KPAD_BUTTON_A = 0x0800u,
     SMG3DS_KPAD_BUTTON_MINUS = 0x1000u,
     SMG3DS_KPAD_BUTTON_Z = 0x2000u,
-    SMG3DS_KPAD_BUTTON_C = 0x4000u
+    SMG3DS_KPAD_BUTTON_C = 0x4000u,
+    SMG3DS_TOUCH_WIDTH = 320,
+    SMG3DS_TOUCH_VIEW_Y = 24,
+    SMG3DS_TOUCH_VIEW_HEIGHT = 192,
+    SMG3DS_COLLISION_ZONE_CAPACITY = 0x200,
+    SMG3DS_COLLISION_ZONE_COUNT_OFFSET = 0x804,
+    SMG3DS_STAGE_ZONE_COUNT_MIN = 1,
+    SMG3DS_STAGE_ZONE_COUNT_MAX = 0x20
 };
 
 static u32 f32_bits(float value)
@@ -198,7 +378,8 @@ static u32 map_host_kpad_buttons(u32 keys)
         buttons |= SMG3DS_KPAD_BUTTON_1;
     if ((keys & KEY_B) != 0u)
         buttons |= SMG3DS_KPAD_BUTTON_B;
-    if ((keys & KEY_A) != 0u)
+    /* Touch click is armed one frame after IR capture; see the HID update. */
+    if ((keys & KEY_A) != 0u || g_host_touch_click_ready)
         buttons |= SMG3DS_KPAD_BUTTON_A;
     if ((keys & KEY_SELECT) != 0u)
         buttons |= SMG3DS_KPAD_BUTTON_MINUS;
@@ -211,13 +392,26 @@ static u32 map_host_kpad_buttons(u32 keys)
 
 static void update_host_controller(void)
 {
+    const bool pointer_was_active = g_host_pointer_active;
+
     hidScanInput();
     g_host_keys_held = hidKeysHeld();
-    g_host_keys_latched_down |= hidKeysDown();
+    g_host_keys_latched_down |= hidKeysDown() & ~KEY_TOUCH;
     hidCircleRead(&g_host_circle);
     g_host_touch_active = (g_host_keys_held & KEY_TOUCH) != 0u;
     if (g_host_touch_active)
         hidTouchRead(&g_host_touch);
+    g_host_pointer_active = g_host_touch_active &&
+        g_host_touch.px < SMG3DS_TOUCH_WIDTH &&
+        g_host_touch.py >= SMG3DS_TOUCH_VIEW_Y &&
+        g_host_touch.py < SMG3DS_TOUCH_VIEW_Y + SMG3DS_TOUCH_VIEW_HEIGHT;
+    /*
+     * Galaxy first captures a valid IR point, then accepts A on a pointed
+     * pane.  Delaying the touchscreen's synthetic A by one host frame gives
+     * the pointer controller time to enter its pointing state.
+     */
+    g_host_touch_click_ready =
+        g_host_pointer_active && pointer_was_active;
 }
 
 
@@ -233,6 +427,40 @@ static bool guest_range_valid(const CPUState* cpu, u32 address, u32 size)
     return physical >= 0x10000000u &&
            end <= 0x10000000ull + SMG3DS_MEM2_SIZE;
 }
+
+static bool guest_object_range_valid(const CPUState* cpu,
+                                     u32 address, u32 size)
+{
+    return (address & 0xc0000000u) == 0x80000000u &&
+           guest_range_valid(cpu, address, size);
+}
+
+static void publish_guest_wpad_connection(CPUState* cpu)
+{
+    const u32 game_system_address =
+        cpu->gpr[13] + (u32)(s32)(-14968);
+    const u32 game_system =
+        guest_range_valid(cpu, game_system_address, 4u) ?
+            mem_read32(cpu, game_system_address) : 0u;
+    const u32 object_holder = guest_range_valid(cpu, game_system, 36u) ?
+        mem_read32(cpu, game_system + 32u) : 0u;
+    const u32 wpad_holder = guest_range_valid(cpu, object_holder, 40u) ?
+        mem_read32(cpu, object_holder + 36u) : 0u;
+    const u32 wpad = guest_range_valid(cpu, wpad_holder, 4u) ?
+        mem_read32(cpu, wpad_holder) : 0u;
+    const u32 info_checker = guest_range_valid(cpu, wpad, 52u) ?
+        mem_read32(cpu, wpad + 48u) : 0u;
+
+    if (!guest_range_valid(cpu, wpad, 55u))
+        return;
+
+    /* Keep Galaxy's connection cache coherent with the KPAD sample below. */
+    mem_write8(cpu, wpad + 53u, 1u);
+    mem_write8(cpu, wpad + 54u, 1u);
+    if (guest_range_valid(cpu, info_checker, 36u))
+        mem_write32(cpu, info_checker + 32u, 4u);
+}
+
 static bool service_kpad_read(CPUState* cpu)
 {
     const u32 channel = cpu->gpr[3];
@@ -273,25 +501,33 @@ static bool service_kpad_read(CPUState* cpu)
     mem_write32(cpu, status + 20u, f32_bits(1.0f));
     mem_write32(cpu, status + 24u, f32_bits(1.0f));
 
-    if (g_host_touch_active) {
-        pointer_x = clamp_unit(((float)g_host_touch.px / 159.5f) - 1.0f);
-        pointer_y = clamp_unit(1.0f - ((float)g_host_touch.py / 119.5f));
+    if (g_host_pointer_active) {
+        pointer_x = clamp_unit(
+            ((float)g_host_touch.px /
+             (float)(SMG3DS_TOUCH_WIDTH - 1)) * 2.0f - 1.0f);
+        pointer_y = clamp_unit(
+            (((float)g_host_touch.py - (float)SMG3DS_TOUCH_VIEW_Y) /
+             (float)(SMG3DS_TOUCH_VIEW_HEIGHT - 1)) * 2.0f - 1.0f);
     }
     mem_write32(cpu, status + 32u, f32_bits(pointer_x));
     mem_write32(cpu, status + 36u, f32_bits(pointer_y));
-    mem_write32(cpu, status + 48u, f32_bits(1.0f));
     mem_write32(cpu, status + 52u, f32_bits(0.0f));
     mem_write32(cpu, status + 56u, f32_bits(1.0f));
+    mem_write32(cpu, status + 72u, f32_bits(1.0f));
 
     /* KPAD device 1 is a Wii Remote with Nunchuk ("freestyle"). */
     mem_write8(cpu, status + 92u, 1u);
     mem_write8(cpu, status + 93u, 0u);
-    mem_write8(cpu, status + 94u, g_host_touch_active ? 1u : 0u);
+    /* KPAD only publishes IR history samples whose DPD validity is >= 2. */
+    mem_write8(cpu, status + 94u,
+               (g_host_pointer_active || g_emulated_ir_connected) ? 2u : 0u);
+    mem_write8(cpu, status + 95u, 1u);
     stick_x = clamp_unit((float)g_host_circle.dx / 156.0f);
     stick_y = clamp_unit((float)g_host_circle.dy / 156.0f);
     mem_write32(cpu, status + 96u, f32_bits(stick_x));
     mem_write32(cpu, status + 100u, f32_bits(stick_y));
 
+    publish_guest_wpad_connection(cpu);
     g_host_keys_latched_down = 0u;
     ++g_kpad_samples;
     cpu->gpr[3] = 1u;
@@ -299,33 +535,6 @@ static bool service_kpad_read(CPUState* cpu)
     return true;
 }
 
-
-static bool guest_strings_equal_case(CPUState* cpu, u32 left, u32 right)
-{
-    enum { SMG3DS_GUEST_STRING_LIMIT = 4096 };
-
-    if (left == 0u || right == 0u)
-        return false;
-    for (u32 offset = 0u; offset < SMG3DS_GUEST_STRING_LIMIT; ++offset) {
-        u8 left_value;
-        u8 right_value;
-
-        if (!guest_range_valid(cpu, left + offset, 1u) ||
-            !guest_range_valid(cpu, right + offset, 1u))
-            return false;
-        left_value = mem_read8(cpu, left + offset);
-        right_value = mem_read8(cpu, right + offset);
-        if (left_value >= (u8)'A' && left_value <= (u8)'Z')
-            left_value = (u8)(left_value + ((u8)'a' - (u8)'A'));
-        if (right_value >= (u8)'A' && right_value <= (u8)'Z')
-            right_value = (u8)(right_value + ((u8)'a' - (u8)'A'));
-        if (left_value != right_value)
-            return false;
-        if (left_value == 0u)
-            return true;
-    }
-    return false;
-}
 
 static void guest_copy_string(CPUState* cpu, u32 address,
                               char* destination, size_t destination_size)
@@ -349,6 +558,240 @@ static void guest_copy_string(CPUState* cpu, u32 address,
             value >= 0x20u && value <= 0x7eu ? (char)value : '?';
     }
     destination[position] = '\0';
+}
+
+static u8 ascii_fold_case(u8 value)
+{
+    if (value >= (u8)'A' && value <= (u8)'Z')
+        return (u8)(value + ((u8)'a' - (u8)'A'));
+    return value;
+}
+
+static bool guest_strings_equal_case_insensitive(CPUState* cpu,
+                                                  u32 first, u32 second)
+{
+    for (u32 offset = 0u; offset < 512u; ++offset) {
+        u8 first_value;
+        u8 second_value;
+        if (!guest_range_valid(cpu, first + offset, 1u) ||
+            !guest_range_valid(cpu, second + offset, 1u)) {
+            return false;
+        }
+        first_value = mem_read8(cpu, first + offset);
+        second_value = mem_read8(cpu, second + offset);
+        if (ascii_fold_case(first_value) != ascii_fold_case(second_value))
+            return false;
+        if (first_value == 0u)
+            return true;
+    }
+    return false;
+}
+
+static s32 guest_string_case_compare(CPUState* cpu, u32 first, u32 second)
+{
+    for (u32 offset = 0u; offset < 1024u; ++offset) {
+        const u32 first_address = first + offset;
+        const u32 second_address = second + offset;
+        u8 first_value;
+        u8 second_value;
+
+        if (!guest_range_valid(cpu, first_address, 1u) ||
+            !guest_range_valid(cpu, second_address, 1u)) {
+            if (first_address == second_address)
+                return 0;
+            return first_address < second_address ? -1 : 1;
+        }
+        first_value = ascii_fold_case(mem_read8(cpu, first_address));
+        second_value = ascii_fold_case(mem_read8(cpu, second_address));
+        if (first_value != second_value)
+            return (s32)first_value - (s32)second_value;
+        if (first_value == 0u)
+            return 0;
+    }
+
+    if (first == second)
+        return 0;
+    return first < second ? -1 : 1;
+}
+
+static bool is_wiiremote_archive_path(const char* path)
+{
+    static const char target[] =
+        "UsEnglish/LayoutData/WiiRemoteStrapReplace.arc";
+
+    if (path == NULL)
+        return false;
+    while (*path == '/')
+        ++path;
+    return strcmp(path, target) == 0;
+}
+
+static u32 archive_holder_find_entry_safe(CPUState* cpu, u32 holder,
+                                           u32 wanted_path)
+{
+    if (holder == 0u || wanted_path == 0u)
+        return 0u;
+
+    const u32 entries = guest_range_valid(cpu, holder, 12u) ?
+        mem_read32(cpu, holder) : 0u;
+    const u32 capacity = guest_range_valid(cpu, holder, 12u) ?
+        mem_read32(cpu, holder + 4u) : 0u;
+    const u32 count = guest_range_valid(cpu, holder, 12u) ?
+        mem_read32(cpu, holder + 8u) : 0u;
+
+    ++g_archive_holder_lookup_fast_paths;
+    if (capacity > 384u || count > capacity ||
+        (count != 0u && entries == 0u) ||
+        !guest_range_valid(cpu, entries, count * 4u) ||
+        !guest_range_valid(cpu, wanted_path, 1u)) {
+        return 0u;
+    }
+
+    for (u32 i = 0u; i < count; ++i) {
+        const u32 candidate = mem_read32(cpu, entries + i * 4u);
+        const u32 archive = guest_range_valid(cpu, candidate, 12u) ?
+            mem_read32(cpu, candidate) : 0u;
+        const u32 heap = guest_range_valid(cpu, candidate, 12u) ?
+            mem_read32(cpu, candidate + 4u) : 0u;
+        const u32 candidate_path = guest_range_valid(cpu, candidate, 12u) ?
+            mem_read32(cpu, candidate + 8u) : 0u;
+        if (candidate == 0u || archive == 0u || heap == 0u ||
+            candidate_path == 0u ||
+            !guest_range_valid(cpu, candidate, 12u) ||
+            !guest_range_valid(cpu, archive, 12u) ||
+            !guest_range_valid(cpu, heap, 4u) ||
+            !guest_range_valid(cpu, candidate_path, 1u)) {
+            ++g_archive_holder_invalid_entries;
+            continue;
+        }
+        u32 canonical_candidate_path = candidate_path;
+        u32 canonical_wanted_path = wanted_path;
+        while (guest_range_valid(cpu, canonical_candidate_path, 1u) &&
+               mem_read8(cpu, canonical_candidate_path) == '/')
+            ++canonical_candidate_path;
+        while (guest_range_valid(cpu, canonical_wanted_path, 1u) &&
+               mem_read8(cpu, canonical_wanted_path) == '/')
+            ++canonical_wanted_path;
+        if (guest_strings_equal_case_insensitive(
+                cpu, canonical_candidate_path, canonical_wanted_path)) {
+            ++g_archive_holder_lookup_hits;
+            return candidate;
+        }
+    }
+    return 0u;
+}
+
+static u32 guest_file_loader(CPUState* cpu)
+{
+    const u32 singleton = cpu->gpr[13] + (u32)(s32)(-10264);
+
+    return guest_range_valid(cpu, singleton, 4u) ?
+        mem_read32(cpu, singleton) : 0u;
+}
+
+static bool file_loader_core_valid(CPUState* cpu, u32 loader)
+{
+    u32 infos;
+    u32 request_count;
+    u32 holder;
+    u32 entries;
+    u32 capacity;
+    u32 count;
+
+    if (!guest_range_valid(cpu, loader, 0x2cu))
+        return false;
+
+    infos = mem_read32(cpu, loader + 0x1cu);
+    request_count = mem_read32(cpu, loader + 0x20u);
+    holder = mem_read32(cpu, loader + 0x24u);
+    if (request_count > 320u ||
+        (request_count != 0u &&
+         !guest_range_valid(cpu, infos, request_count * 0x90u)) ||
+        !guest_range_valid(cpu, holder, 12u)) {
+        return false;
+    }
+
+    entries = mem_read32(cpu, holder);
+    capacity = mem_read32(cpu, holder + 4u);
+    count = mem_read32(cpu, holder + 8u);
+    return capacity == 384u && count <= capacity &&
+           guest_range_valid(cpu, entries, capacity * 4u);
+}
+
+static u32 reconcile_file_loader_identity(CPUState* cpu, u32 candidate)
+{
+    const u32 canonical = guest_file_loader(cpu);
+
+    if (file_loader_core_valid(cpu, candidate) ||
+        !file_loader_core_valid(cpu, canonical)) {
+        return candidate;
+    }
+
+    ++g_file_loader_identity_repairs;
+    return canonical;
+}
+
+static bool file_loader_archive_mounted(CPUState* cpu, u32 loader, u32 path)
+{
+    const u32 holder = guest_range_valid(cpu, loader, 0x2cu) ?
+        mem_read32(cpu, loader + 0x28u) : 0u;
+
+    return archive_holder_find_entry_safe(cpu, holder, path) != 0u;
+}
+
+static u32 guest_stage_archive_heap(CPUState* cpu)
+{
+    /*
+     * Mirror MR::getAproposHeapForSceneArchive(0.03f).  The previous walk
+     * through GameSystemObjHolder + 0x20 reached AudSystemWrapper, so every
+     * recovered archive was incorrectly consuming the small audio heap.
+     */
+    const u32 watcher_addr = cpu->gpr[13] + (u32)(s32)(-10308);
+    const u32 watcher = guest_range_valid(cpu, watcher_addr, 4u) ?
+        mem_read32(cpu, watcher_addr) : 0u;
+    const u32 file_cache_heap = guest_range_valid(cpu, watcher, 28u) ?
+        mem_read32(cpu, watcher + 16u) : 0u;
+    const u32 scene_gddr_heap = guest_range_valid(cpu, watcher, 28u) ?
+        mem_read32(cpu, watcher + 24u) : 0u;
+
+    if (guest_range_valid(cpu, file_cache_heap, 112u)) {
+        const u32 heap_size = mem_read32(cpu, file_cache_heap + 56u);
+        const u32 free_size = mem_read32(cpu, file_cache_heap + 108u);
+
+        if (heap_size != 0u &&
+            (u64)free_size * 100u >= (u64)heap_size * 3u) {
+            return file_cache_heap;
+        }
+    }
+
+    if (guest_range_valid(cpu, scene_gddr_heap, 4u)) {
+        return scene_gddr_heap;
+    }
+
+    return guest_range_valid(cpu, file_cache_heap, 4u) ?
+        file_cache_heap : 0u;
+}
+
+static u32 guest_scene_obj_holder(CPUState* cpu)
+{
+    const u32 game_system_address =
+        cpu->gpr[13] + (u32)(s32)(-14968);
+    const u32 game_system =
+        guest_range_valid(cpu, game_system_address, 4u) ?
+            mem_read32(cpu, game_system_address) : 0u;
+    const u32 scene_controller =
+        guest_range_valid(cpu, game_system, 40u) ?
+            mem_read32(cpu, game_system + 36u) : 0u;
+    const u32 scene_holder_owner =
+        guest_range_valid(cpu, scene_controller, 176u) ?
+            mem_read32(cpu, scene_controller + 172u) : 0u;
+    const u32 scene_holder =
+        guest_range_valid(cpu, scene_holder_owner, 20u) ?
+            mem_read32(cpu, scene_holder_owner + 16u) : 0u;
+
+    return guest_range_valid(
+        cpu, scene_holder, (SMG3DS_SCENE_WIPE_OBJ_ID + 1u) * 4u) ?
+            scene_holder : 0u;
 }
 
 static bool canonicalize_guest_disc_path(CPUState* cpu, u32 address)
@@ -400,8 +843,1560 @@ static bool recover_file_ripper_separator_panic(CPUState* cpu)
 }
 
 #ifdef SMG3DS_WITH_GENERATED
+static bool service_coherent_cache_range(CPUState* cpu);
+static bool service_yaz0_decompression(CPUState* cpu);
+static bool service_optional_platform_module(CPUState* cpu);
+static bool vi_interrupt_pending(void);
+static void signal_video_retrace(void);
+
+static bool service_collision_zone_registration(CPUState* cpu)
+{
+    const u32 zone = cpu->gpr[3];
+    const u32 parts = cpu->gpr[4];
+    u32 count;
+
+    if (!guest_object_range_valid(cpu, zone,
+                                  SMG3DS_COLLISION_ZONE_COUNT_OFFSET + 4u))
+        return false;
+
+    count = mem_read32(cpu, zone + SMG3DS_COLLISION_ZONE_COUNT_OFFSET);
+    if (count > SMG3DS_COLLISION_ZONE_CAPACITY) {
+        ++g_collision_zone_count_repairs;
+        mem_write32(cpu, zone + SMG3DS_COLLISION_ZONE_COUNT_OFFSET,
+                    SMG3DS_COLLISION_ZONE_CAPACITY);
+        if (g_debug_file != NULL) {
+            fprintf(g_debug_file,
+                    "COLLISION_ZONE_COUNT_REPAIR zone=%08lX "
+                    "parts=%08lX count=%lu capacity=%u lr=%08lX\n",
+                    (unsigned long)zone, (unsigned long)parts,
+                    (unsigned long)count,
+                    SMG3DS_COLLISION_ZONE_CAPACITY,
+                    (unsigned long)cpu->lr);
+            fflush(g_debug_file);
+        }
+        cpu->pc = cpu->lr & ~3u;
+        return true;
+    }
+
+    for (u32 index = 0u; index < count; ++index) {
+        if (mem_read32(cpu, zone + 4u + index * 4u) == parts) {
+            ++g_collision_zone_duplicate_skips;
+            if (g_debug_file != NULL) {
+                fprintf(g_debug_file,
+                        "COLLISION_ZONE_DUPLICATE zone=%08lX "
+                        "parts=%08lX count=%lu index=%lu lr=%08lX\n",
+                        (unsigned long)zone, (unsigned long)parts,
+                        (unsigned long)count, (unsigned long)index,
+                        (unsigned long)cpu->lr);
+                fflush(g_debug_file);
+            }
+            cpu->pc = cpu->lr & ~3u;
+            return true;
+        }
+    }
+
+    if (count == SMG3DS_COLLISION_ZONE_CAPACITY) {
+        ++g_collision_zone_capacity_skips;
+        if (g_debug_file != NULL) {
+            fprintf(g_debug_file,
+                    "COLLISION_ZONE_CAPACITY zone=%08lX "
+                    "parts=%08lX count=%lu lr=%08lX\n",
+                    (unsigned long)zone, (unsigned long)parts,
+                    (unsigned long)count, (unsigned long)cpu->lr);
+            fflush(g_debug_file);
+        }
+        cpu->pc = cpu->lr & ~3u;
+        return true;
+    }
+
+    if (count + 1u > g_collision_zone_max_parts)
+        g_collision_zone_max_parts = count + 1u;
+    return false;
+}
+
+static void service_collision_zone_calculation(CPUState* cpu)
+{
+    const u32 return_address = cpu->lr & ~3u;
+    const u32 zone = cpu->gpr[29];
+    u32 count;
+
+    if (return_address < 0x8017486Cu ||
+        return_address >= 0x801749C0u ||
+        !guest_object_range_valid(cpu, zone,
+                                  SMG3DS_COLLISION_ZONE_COUNT_OFFSET + 4u))
+        return;
+
+    count = mem_read32(cpu, zone + SMG3DS_COLLISION_ZONE_COUNT_OFFSET);
+    if (count > g_collision_zone_max_parts) {
+        g_collision_zone_max_parts = count;
+        if (g_debug_file != NULL) {
+            fprintf(g_debug_file,
+                    "COLLISION_ZONE_CALC zone=%08lX count=%lu "
+                    "cursor=%08lX return=%08lX\n",
+                    (unsigned long)zone, (unsigned long)count,
+                    (unsigned long)cpu->gpr[30],
+                    (unsigned long)return_address);
+            fflush(g_debug_file);
+        }
+    }
+
+    if (count > SMG3DS_COLLISION_ZONE_CAPACITY) {
+        ++g_collision_zone_count_repairs;
+        mem_write32(cpu, zone + SMG3DS_COLLISION_ZONE_COUNT_OFFSET,
+                    SMG3DS_COLLISION_ZONE_CAPACITY);
+        if (g_debug_file != NULL) {
+            fprintf(g_debug_file,
+                    "COLLISION_ZONE_CALC_CAP zone=%08lX "
+                    "count=%lu capacity=%u cursor=%08lX return=%08lX\n",
+                    (unsigned long)zone, (unsigned long)count,
+                    SMG3DS_COLLISION_ZONE_CAPACITY,
+                    (unsigned long)cpu->gpr[30],
+                    (unsigned long)return_address);
+            fflush(g_debug_file);
+        }
+    }
+}
+
 int dolrecomp_dispatch_replacement(CPUState* cpu, u32 address)
 {
+    service_collision_zone_calculation(cpu);
+
+    if (address == SMG3DS_GET_STAGE_ZONE_COUNT) {
+        const u32 current_thread = mem_read32(cpu, 0x800000e4u);
+        const bool query_return =
+            g_zone_count_query_pending &&
+            current_thread == g_zone_count_query_thread &&
+            (cpu->lr & ~3u) == SMG3DS_GET_STAGE_ZONE_COUNT;
+
+        if (query_return) {
+            const u32 reported_count = cpu->gpr[3];
+
+            g_zone_count_query_pending = false;
+            cpu->lr = g_zone_count_query_return;
+            if ((s32)reported_count < SMG3DS_STAGE_ZONE_COUNT_MIN) {
+                cpu->gpr[3] = SMG3DS_STAGE_ZONE_COUNT_MIN;
+                ++g_zone_count_minimum_repairs;
+            } else if (reported_count > SMG3DS_STAGE_ZONE_COUNT_MAX) {
+                cpu->gpr[3] = SMG3DS_STAGE_ZONE_COUNT_MAX;
+                ++g_zone_count_maximum_repairs;
+            }
+            if (cpu->gpr[3] != reported_count && g_debug_file != NULL) {
+                fprintf(g_debug_file,
+                        "STAGE_ZONE_COUNT_REPAIR reported=%ld effective=%lu "
+                        "thread=%08lX return=%08lX\n",
+                        (long)(s32)reported_count,
+                        (unsigned long)cpu->gpr[3],
+                        (unsigned long)current_thread,
+                        (unsigned long)cpu->lr);
+                fflush(g_debug_file);
+            }
+            cpu->pc = cpu->lr & ~3u;
+            return 1;
+        }
+
+        if (!g_zone_count_query_pending) {
+            g_zone_count_query_pending = true;
+            g_zone_count_query_thread = current_thread;
+            g_zone_count_query_return = cpu->lr;
+            cpu->lr = SMG3DS_GET_STAGE_ZONE_COUNT;
+        }
+    }
+
+    if (address == SMG3DS_COLLISION_ZONE_ADD_PARTS &&
+        service_collision_zone_registration(cpu))
+        return 1;
+
+    if (address == SMG3DS_SYSTEM_WIPE_REQUIRED) {
+        const u32 current_thread = mem_read32(cpu, 0x800000e4u);
+        const u32 game_system_address =
+            cpu->gpr[13] + (u32)(s32)(-14968);
+        const u32 game_system =
+            guest_range_valid(cpu, game_system_address, 4u) ?
+                mem_read32(cpu, game_system_address) : 0u;
+        u32 system_wipe = guest_range_valid(cpu, game_system, 52u) ?
+            mem_read32(cpu, game_system + 48u) : 0u;
+        const bool create_return =
+            g_system_wipe_create_pending &&
+            current_thread == g_system_wipe_create_thread &&
+            (cpu->lr & ~3u) == SMG3DS_SYSTEM_WIPE_REQUIRED;
+
+        if (create_return) {
+            const u32 create_result = cpu->gpr[3];
+
+            g_system_wipe_create_pending = false;
+            cpu->lr = g_system_wipe_saved_return;
+            if (create_result != 0u &&
+                guest_range_valid(cpu, game_system, 52u)) {
+                mem_write32(cpu, game_system + 48u, create_result);
+                system_wipe = create_result;
+            }
+            if (g_debug_file != NULL) {
+                fprintf(g_debug_file,
+                        "SYSTEM_WIPE_CREATE_RESULT game=%08lX "
+                        "wipe=%08lX result=%08lX return=%08lX\n",
+                        (unsigned long)game_system,
+                        (unsigned long)system_wipe,
+                        (unsigned long)create_result,
+                        (unsigned long)g_system_wipe_saved_return);
+                fflush(g_debug_file);
+            }
+            if (system_wipe == 0u) {
+                ++g_system_wipe_create_failures;
+                cpu->gpr[3] = 0u;
+                cpu->pc = cpu->lr & ~3u;
+                return 1;
+            }
+        } else if (system_wipe == 0u &&
+                   !g_system_wipe_create_pending && game_system != 0u) {
+            g_system_wipe_create_pending = true;
+            g_system_wipe_create_thread = current_thread;
+            g_system_wipe_saved_return = cpu->lr;
+            ++g_system_wipe_create_attempts;
+            if (g_debug_file != NULL) {
+                fprintf(g_debug_file,
+                        "SYSTEM_WIPE_CREATE_BEGIN game=%08lX "
+                        "return=%08lX thread=%08lX\n",
+                        (unsigned long)game_system,
+                        (unsigned long)cpu->lr,
+                        (unsigned long)current_thread);
+                fflush(g_debug_file);
+            }
+            cpu->lr = SMG3DS_SYSTEM_WIPE_REQUIRED;
+            cpu->pc = SMG3DS_CREATE_SYSTEM_WIPE_HOLDER;
+            return 1;
+        } else if (system_wipe == 0u) {
+            if (g_debug_file != NULL) {
+                fprintf(g_debug_file,
+                        "SYSTEM_WIPE_NULL_BYPASS game=%08lX pending=%u "
+                        "thread=%08lX owner=%08lX lr=%08lX\n",
+                        (unsigned long)game_system,
+                        g_system_wipe_create_pending ? 1u : 0u,
+                        (unsigned long)current_thread,
+                        (unsigned long)g_system_wipe_create_thread,
+                        (unsigned long)cpu->lr);
+                fflush(g_debug_file);
+            }
+            cpu->gpr[3] = 0u;
+            cpu->pc = cpu->lr & ~3u;
+            return 1;
+        }
+    }
+
+    if (address == SMG3DS_SCENE_WIPE_FORCE_OPEN) {
+        const u32 current_thread = mem_read32(cpu, 0x800000e4u);
+        const u32 scene_holder = guest_scene_obj_holder(cpu);
+        const u32 wipe = scene_holder != 0u ?
+            mem_read32(cpu, scene_holder +
+                SMG3DS_SCENE_WIPE_OBJ_ID * 4u) : 0u;
+        const bool create_return =
+            g_scene_wipe_create_pending &&
+            current_thread == g_scene_wipe_create_thread &&
+            (cpu->lr & ~3u) == SMG3DS_SCENE_WIPE_FORCE_OPEN;
+
+        if (create_return) {
+            char wipe_name[64];
+            const u32 create_result = cpu->gpr[3];
+
+            guest_copy_string(cpu, g_scene_wipe_saved_name, wipe_name,
+                              sizeof(wipe_name));
+            g_scene_wipe_create_pending = false;
+            cpu->gpr[3] = g_scene_wipe_saved_name;
+            cpu->lr = g_scene_wipe_saved_return;
+            if (g_debug_file != NULL) {
+                fprintf(g_debug_file,
+                        "SCENE_WIPE_CREATE_RESULT holder=%08lX "
+                        "wipe=%08lX result=%08lX name=%s "
+                        "return=%08lX\n",
+                        (unsigned long)scene_holder,
+                        (unsigned long)wipe,
+                        (unsigned long)create_result,
+                        wipe_name[0] != '\0' ? wipe_name : "-",
+                        (unsigned long)g_scene_wipe_saved_return);
+                fflush(g_debug_file);
+            }
+            if (wipe == 0u) {
+                ++g_scene_wipe_create_failures;
+                cpu->pc = cpu->lr & ~3u;
+                return 1;
+            }
+        } else if (wipe == 0u && !g_scene_wipe_create_pending &&
+                   scene_holder != 0u) {
+            char wipe_name[64];
+
+            guest_copy_string(cpu, cpu->gpr[3], wipe_name,
+                              sizeof(wipe_name));
+            g_scene_wipe_create_pending = true;
+            g_scene_wipe_create_thread = current_thread;
+            g_scene_wipe_saved_name = cpu->gpr[3];
+            g_scene_wipe_saved_return = cpu->lr;
+            ++g_scene_wipe_create_attempts;
+            if (g_debug_file != NULL) {
+                fprintf(g_debug_file,
+                        "SCENE_WIPE_CREATE_BEGIN holder=%08lX "
+                        "name=%s return=%08lX thread=%08lX\n",
+                        (unsigned long)scene_holder,
+                        wipe_name[0] != '\0' ? wipe_name : "-",
+                        (unsigned long)cpu->lr,
+                        (unsigned long)current_thread);
+                fflush(g_debug_file);
+            }
+            cpu->gpr[3] = SMG3DS_SCENE_WIPE_OBJ_ID;
+            cpu->lr = SMG3DS_SCENE_WIPE_FORCE_OPEN;
+            cpu->pc = SMG3DS_CREATE_SCENE_OBJ;
+            return 1;
+        } else if (wipe == 0u) {
+            /*
+             * A nested wipe request can occur while createSceneObj is still
+             * constructing the holder. Its slot is intentionally published
+             * only after initWithoutIter finishes, so defer that cosmetic
+             * request instead of dereferencing a partially built object.
+             */
+            if (g_debug_file != NULL) {
+                fprintf(g_debug_file,
+                        "SCENE_WIPE_NULL_BYPASS holder=%08lX "
+                        "pending=%u thread=%08lX owner=%08lX lr=%08lX\n",
+                        (unsigned long)scene_holder,
+                        g_scene_wipe_create_pending ? 1u : 0u,
+                        (unsigned long)current_thread,
+                        (unsigned long)g_scene_wipe_create_thread,
+                        (unsigned long)cpu->lr);
+                fflush(g_debug_file);
+            }
+            cpu->pc = cpu->lr & ~3u;
+            return 1;
+        }
+    }
+
+    if (address == SMG3DS_FILE_LOADER_REQUEST_MOUNT_ARCHIVE) {
+        char mount_path[96];
+
+        guest_copy_string(cpu, cpu->gpr[4], mount_path,
+                          sizeof(mount_path));
+        if (is_wiiremote_archive_path(mount_path) &&
+            mount_path[0] != '/') {
+            u32 length = 0u;
+            while (length + 1u < 256u &&
+                   guest_range_valid(cpu, cpu->gpr[4] + length, 1u) &&
+                   mem_read8(cpu, cpu->gpr[4] + length) != 0u) {
+                ++length;
+            }
+            if (length + 1u < 256u &&
+                guest_range_valid(cpu, cpu->gpr[4], length + 2u)) {
+                for (u32 offset = length + 1u; offset > 0u; --offset) {
+                    mem_write8(cpu, cpu->gpr[4] + offset,
+                               mem_read8(cpu, cpu->gpr[4] + offset - 1u));
+                }
+                mem_write8(cpu, cpu->gpr[4], '/');
+                if (g_debug_file != NULL) {
+                    fprintf(g_debug_file,
+                            "WIIMOTE_ARCHIVE_PATH_CANONICALIZED "
+                            "path=/%s loader=%08lX\n",
+                            mount_path, (unsigned long)cpu->gpr[3]);
+                    fflush(g_debug_file);
+                }
+            }
+        }
+        if (mount_path[0] != '\0') {
+            const u32 loader = cpu->gpr[3];
+            const u32 file_holder =
+                loader != 0u && guest_range_valid(cpu, loader, 0x28u) ?
+                    mem_read32(cpu, loader + 0x24u) : 0u;
+            const u32 file_entries =
+                file_holder != 0u &&
+                guest_range_valid(cpu, file_holder, 12u) ?
+                    mem_read32(cpu, file_holder) : 0u;
+            u32 file_count =
+                file_holder != 0u &&
+                guest_range_valid(cpu, file_holder, 12u) ?
+                    mem_read32(cpu, file_holder + 8u) : 0u;
+            u32 invalid_relabels = 0u;
+            u32 first_entry = 0u;
+            u32 first_disc = 0u;
+
+            if (file_count > 384u)
+                file_count = 384u;
+            if (file_entries != 0u &&
+                guest_range_valid(cpu, file_entries,
+                                  file_count * 4u)) {
+                for (u32 i = 0u; i < file_count; ++i) {
+                    const u32 file_entry =
+                        mem_read32(cpu, file_entries + i * 4u);
+                    if (i == 0u) {
+                        first_entry = file_entry;
+                        first_disc =
+                            file_entry != 0u &&
+                            guest_range_valid(cpu, file_entry, 4u) ?
+                                mem_read32(cpu, file_entry) : 0u;
+                    }
+                    if (file_entry != 0u &&
+                        guest_range_valid(cpu, file_entry, 4u) &&
+                        mem_read32(cpu, file_entry) == 0xffffffffu) {
+                        mem_write32(cpu, file_entry,
+                                    0x80000000u | i);
+                        ++invalid_relabels;
+                    }
+                }
+            }
+            if (g_debug_file != NULL) {
+                fprintf(g_debug_file,
+                        "BOOT_ARCHIVE_FILEHOLDER_REPAIR path=%s "
+                        "loader=%08lX lr=%08lX "
+                        "holder=%08lX vector=%08lX count=%lu "
+                        "first=%08lX/%08lX relabeled=%lu\n",
+                        mount_path[0] != '\0' ? mount_path : "-",
+                        (unsigned long)loader,
+                        (unsigned long)cpu->lr,
+                        (unsigned long)file_holder,
+                        (unsigned long)file_entries,
+                        (unsigned long)file_count,
+                        (unsigned long)first_entry,
+                        (unsigned long)first_disc,
+                        (unsigned long)invalid_relabels);
+                fflush(g_debug_file);
+            }
+            if (g_debug_file != NULL) {
+                const u32 infos = guest_range_valid(cpu, loader, 0x24u) ?
+                    mem_read32(cpu, loader + 0x1cu) : 0u;
+                u32 request_count =
+                    guest_range_valid(cpu, loader, 0x24u) ?
+                        mem_read32(cpu, loader + 0x20u) : 0u;
+                s32 target_disc = -1;
+
+                smg3ds_disc_resolve_path(cpu, cpu->gpr[4], &target_disc);
+                if (request_count > 320u)
+                    request_count = 320u;
+                fprintf(g_debug_file,
+                        "BOOT_ARCHIVE_STATE path=%s target=%08lX "
+                        "files=%lu requests=%lu infos=%08lX\n",
+                        mount_path[0] != '\0' ? mount_path : "-",
+                        (unsigned long)(u32)target_disc,
+                        (unsigned long)file_count,
+                        (unsigned long)request_count,
+                        (unsigned long)infos);
+                for (u32 i = 0u; i < file_count && i < 8u; ++i) {
+                    const u32 entry = mem_read32(
+                        cpu, file_entries + i * 4u);
+                    fprintf(g_debug_file,
+                            "BOOT_ARCHIVE_FILE index=%lu entry=%08lX "
+                            "disc=%08lX context=%08lX heap=%08lX "
+                            "state=%08lX\n",
+                            (unsigned long)i,
+                            (unsigned long)entry,
+                            (unsigned long)(guest_range_valid(
+                                cpu, entry, 16u) ?
+                                    mem_read32(cpu, entry) : 0u),
+                            (unsigned long)(guest_range_valid(
+                                cpu, entry, 16u) ?
+                                    mem_read32(cpu, entry + 4u) : 0u),
+                            (unsigned long)(guest_range_valid(
+                                cpu, entry, 16u) ?
+                                    mem_read32(cpu, entry + 8u) : 0u),
+                            (unsigned long)(guest_range_valid(
+                                cpu, entry, 16u) ?
+                                    mem_read32(cpu, entry + 12u) : 0u));
+                }
+                if (infos != 0u && guest_range_valid(
+                        cpu, infos, request_count * 0x90u)) {
+                    for (u32 i = 0u; i < request_count && i < 8u; ++i) {
+                        const u32 info = infos + i * 0x90u;
+                        char request_path[96];
+
+                        guest_copy_string(cpu, info + 8u, request_path,
+                                          sizeof(request_path));
+                        fprintf(g_debug_file,
+                                "BOOT_ARCHIVE_REQUEST index=%lu "
+                                "path=%s kind=%08lX/%08lX "
+                                "phase=%08lX file=%08lX\n",
+                                (unsigned long)i,
+                                request_path[0] != '\0' ?
+                                    request_path : "-",
+                                (unsigned long)mem_read32(cpu, info),
+                                (unsigned long)mem_read32(cpu, info + 4u),
+                                (unsigned long)mem_read32(cpu, info + 0x88u),
+                                (unsigned long)mem_read32(cpu, info + 0x8cu));
+                    }
+                }
+                fflush(g_debug_file);
+            }
+            if (loader != 0u &&
+                guest_range_valid(cpu, loader, 0x24u)) {
+                const u32 infos = mem_read32(cpu, loader + 0x1cu);
+                const u32 request_count = mem_read32(cpu, loader + 0x20u);
+                bool target_present = false;
+                bool all_completed = true;
+
+                if (request_count <= 320u && infos != 0u &&
+                    guest_range_valid(cpu, infos,
+                                      request_count * 0x90u)) {
+                    for (u32 i = 0u; i < request_count; ++i) {
+                        const u32 request_info = infos + i * 0x90u;
+
+                        if (guest_strings_equal_case_insensitive(
+                                cpu, request_info + 8u, cpu->gpr[4])) {
+                            target_present = true;
+                        }
+                        if (mem_read32(cpu, request_info + 0x88u) != 2u)
+                            all_completed = false;
+                    }
+                    if (!target_present && all_completed &&
+                        request_count != 0u) {
+                        mem_write32(cpu, loader + 0x20u, 0u);
+                        if (g_debug_file != NULL) {
+                            fprintf(g_debug_file,
+                                    "BOOT_ARCHIVE_COMPLETED_REQUESTS_CLEARED "
+                                    "path=%s old_count=%lu "
+                                    "infos=%08lX\n",
+                                    mount_path[0] != '\0' ?
+                                        mount_path : "-",
+                                    (unsigned long)request_count,
+                                    (unsigned long)infos);
+                            fflush(g_debug_file);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (address == SMG3DS_RECEIVE_ARCHIVE_WRAPPER_RETURN) {
+        const u32 loader = mem_read32(
+            cpu, cpu->gpr[13] + (u32)(s32)(-10264));
+        const u32 holder = guest_range_valid(cpu, loader, 0x2cu) ?
+            mem_read32(cpu, loader + 0x28u) : 0u;
+        const u32 path = cpu->gpr[1] + 8u;
+        const u32 entry = archive_holder_find_entry_safe(
+            cpu, holder, path);
+        const u32 published_archive =
+            entry != 0u && guest_range_valid(cpu, entry, 12u) ?
+                mem_read32(cpu, entry) : 0u;
+        char receive_path[96];
+
+        guest_copy_string(cpu, path, receive_path, sizeof(receive_path));
+        if (g_debug_file != NULL) {
+            fprintf(g_debug_file,
+                    "RECEIVE_ARCHIVE_RESULT path=%s result=%08lX "
+                    "published=%08lX entry=%08lX caller=%08lX\n",
+                    receive_path[0] != '\0' ? receive_path : "-",
+                    (unsigned long)cpu->gpr[3],
+                    (unsigned long)published_archive,
+                    (unsigned long)entry,
+                    (unsigned long)(guest_range_valid(
+                        cpu, cpu->gpr[1] + 276u, 4u) ?
+                            mem_read32(cpu, cpu->gpr[1] + 276u) : 0u));
+            fflush(g_debug_file);
+        }
+        if (is_wiiremote_archive_path(receive_path) &&
+            g_debug_file != NULL) {
+            const u32 infos =
+                loader != 0u && guest_range_valid(cpu, loader, 0x2cu) ?
+                    mem_read32(cpu, loader + 0x1cu) : 0u;
+            const u32 request_count =
+                loader != 0u && guest_range_valid(cpu, loader, 0x2cu) ?
+                    mem_read32(cpu, loader + 0x20u) : 0u;
+            u32 request_info = 0u;
+            u32 file_entry = 0u;
+            for (u32 i = 0u; i < request_count && i < 1024u; ++i) {
+                const u32 candidate = infos + i * 0x90u;
+                if (candidate == 0u ||
+                    !guest_range_valid(cpu, candidate, 0x90u))
+                    break;
+                if (guest_strings_equal_case_insensitive(
+                        cpu, candidate + 8u, path)) {
+                    request_info = candidate;
+                    file_entry = mem_read32(cpu, candidate + 0x8cu);
+                    break;
+                }
+            }
+            fprintf(g_debug_file,
+                    "WIIMOTE_ARCHIVE_STATE loader=%08lX requests=%lu "
+                    "info=%08lX phase=%08lX file=%08lX "
+                    "disc=%08lX context=%08lX heap=%08lX state=%08lX "
+                    "holder=%08lX vector=%08lX capacity=%lu count=%lu\n",
+                    (unsigned long)loader,
+                    (unsigned long)request_count,
+                    (unsigned long)request_info,
+                    (unsigned long)(request_info != 0u ?
+                        mem_read32(cpu, request_info + 0x88u) : 0u),
+                    (unsigned long)file_entry,
+                    (unsigned long)(file_entry != 0u &&
+                        guest_range_valid(cpu, file_entry, 0x38u) ?
+                            mem_read32(cpu, file_entry) : 0u),
+                    (unsigned long)(file_entry != 0u &&
+                        guest_range_valid(cpu, file_entry, 0x38u) ?
+                            mem_read32(cpu, file_entry + 4u) : 0u),
+                    (unsigned long)(file_entry != 0u &&
+                        guest_range_valid(cpu, file_entry, 0x38u) ?
+                            mem_read32(cpu, file_entry + 8u) : 0u),
+                    (unsigned long)(file_entry != 0u &&
+                        guest_range_valid(cpu, file_entry, 0x38u) ?
+                            mem_read32(cpu, file_entry + 0x0cu) : 0u),
+                    (unsigned long)holder,
+                    (unsigned long)(holder != 0u &&
+                        guest_range_valid(cpu, holder, 12u) ?
+                            mem_read32(cpu, holder) : 0u),
+                    (unsigned long)(holder != 0u &&
+                        guest_range_valid(cpu, holder, 12u) ?
+                            mem_read32(cpu, holder + 4u) : 0u),
+                    (unsigned long)(holder != 0u &&
+                        guest_range_valid(cpu, holder, 12u) ?
+                            mem_read32(cpu, holder + 8u) : 0u));
+            fflush(g_debug_file);
+        }
+        if (published_archive != 0u &&
+            cpu->gpr[3] != published_archive) {
+            ++g_receive_archive_identity_repairs;
+            g_receive_archive_stale_result = cpu->gpr[3];
+            g_receive_archive_canonical_result = published_archive;
+            if (g_debug_file != NULL) {
+                fprintf(g_debug_file,
+                        "RECEIVE_ARCHIVE_IDENTITY_REPAIRED path=%s "
+                        "stale=%08lX canonical=%08lX entry=%08lX\n",
+                        receive_path[0] != '\0' ? receive_path : "-",
+                        (unsigned long)g_receive_archive_stale_result,
+                        (unsigned long)g_receive_archive_canonical_result,
+                        (unsigned long)entry);
+                fflush(g_debug_file);
+            }
+            cpu->gpr[3] = published_archive;
+        } else if (cpu->gpr[3] != 0u && published_archive == 0u) {
+            ++g_receive_archive_false_hits;
+            g_receive_archive_false_result = cpu->gpr[3];
+            cpu->gpr[3] = 0u;
+        }
+    }
+
+    if (address == SMG3DS_MOUNTED_ARCHIVE_WRAPPER_RETURN) {
+        char mounted_path[96];
+
+        guest_copy_string(cpu, cpu->gpr[1] + 8u, mounted_path,
+                          sizeof(mounted_path));
+        const u32 loader = mem_read32(
+            cpu, cpu->gpr[13] + (u32)(s32)(-10264));
+        const u32 holder = guest_range_valid(cpu, loader, 0x2cu) ?
+            mem_read32(cpu, loader + 0x28u) : 0u;
+        const u32 entry = archive_holder_find_entry_safe(
+            cpu, holder, cpu->gpr[1] + 8u);
+        const u32 archive =
+            entry != 0u ? mem_read32(cpu, entry) : 0u;
+        const u32 heap =
+            entry != 0u ? mem_read32(cpu, entry + 4u) : 0u;
+
+        if (guest_range_valid(cpu, cpu->gpr[30], 4u))
+            mem_write32(cpu, cpu->gpr[30], archive);
+        if (guest_range_valid(cpu, cpu->gpr[31], 4u))
+            mem_write32(cpu, cpu->gpr[31], heap);
+        if (g_debug_file != NULL) {
+            fprintf(g_debug_file,
+                    "MOUNTED_ARCHIVE_RESULT path=%s archive=%08lX "
+                    "heap=%08lX outs=%08lX/%08lX caller=%08lX\n",
+                    mounted_path[0] != '\0' ? mounted_path : "-",
+                    (unsigned long)(guest_range_valid(
+                        cpu, cpu->gpr[30], 4u) ?
+                            mem_read32(cpu, cpu->gpr[30]) : 0u),
+                    (unsigned long)(guest_range_valid(
+                        cpu, cpu->gpr[31], 4u) ?
+                            mem_read32(cpu, cpu->gpr[31]) : 0u),
+                    (unsigned long)cpu->gpr[30],
+                    (unsigned long)cpu->gpr[31],
+                    (unsigned long)(guest_range_valid(
+                        cpu, cpu->gpr[1] + 292u, 4u) ?
+                            mem_read32(cpu, cpu->gpr[1] + 292u) : 0u));
+            fflush(g_debug_file);
+        }
+    }
+
+    if (address == SMG3DS_FUNCTION_ASYNC_WAIT_NOT_FOUND &&
+        cpu->gpr[31] == cpu->gpr[29]) {
+        const u32 wait_frame = cpu->gpr[1];
+        const u32 wrapper_frame = guest_range_valid(cpu, wait_frame, 4u) ?
+            mem_read32(cpu, wait_frame) : 0u;
+        const u32 owner_frame =
+            guest_range_valid(cpu, wrapper_frame, 4u) ?
+                mem_read32(cpu, wrapper_frame) : 0u;
+        char async_name[96];
+        char owner_path[96];
+
+        guest_copy_string(cpu, cpu->gpr[28], async_name,
+                          sizeof(async_name));
+        owner_path[0] = '\0';
+        if (guest_range_valid(cpu, owner_frame + 20u, 1u))
+            guest_copy_string(cpu, owner_frame + 20u, owner_path,
+                              sizeof(owner_path));
+        /*
+         * FunctionAsyncExecutor::waitForEnd assumes the requested job is
+         * still present and dereferences mHolders.end() when it is not.  A
+         * recovered archive request can finish during the main-thread
+         * handoff, so treat an absent job as already completed.  The search
+         * still owns MutexHolder<2> here: release it through the guest OS,
+         * then resume at waitForEnd's register/stack epilogue.
+         */
+        ++g_async_wait_missing_bypasses;
+        g_async_wait_missing_executor = cpu->gpr[30];
+        g_async_wait_missing_name = cpu->gpr[28];
+        if (g_debug_file != NULL) {
+            fprintf(g_debug_file,
+                    "ASYNC_WAIT_MISSING name=%s exec=%08lX count=%lu "
+                    "frames=%08lX/%08lX/%08lX owner=%08lX/%08lX/%08lX "
+                    "path=%s\n",
+                    async_name[0] != '\0' ? async_name : "-",
+                    (unsigned long)cpu->gpr[30],
+                    (unsigned long)(guest_range_valid(
+                        cpu, cpu->gpr[30], 1040u) ?
+                            mem_read32(cpu, cpu->gpr[30] + 1036u) :
+                            0xffffffffu),
+                    (unsigned long)wait_frame,
+                    (unsigned long)wrapper_frame,
+                    (unsigned long)owner_frame,
+                    (unsigned long)(guest_range_valid(
+                        cpu, owner_frame + 8u, 12u) ?
+                            mem_read32(cpu, owner_frame + 8u) : 0u),
+                    (unsigned long)(guest_range_valid(
+                        cpu, owner_frame + 8u, 12u) ?
+                            mem_read32(cpu, owner_frame + 12u) : 0u),
+                    (unsigned long)(guest_range_valid(
+                        cpu, owner_frame + 8u, 12u) ?
+                            mem_read32(cpu, owner_frame + 16u) : 0u),
+                    owner_path[0] != '\0' ? owner_path : "-");
+            fflush(g_debug_file);
+        }
+        cpu->gpr[3] = SMG3DS_FUNCTION_ASYNC_MUTEX;
+        cpu->lr = SMG3DS_FUNCTION_ASYNC_WAIT_EPILOGUE;
+        cpu->pc = SMG3DS_OS_UNLOCK_MUTEX;
+        return 1;
+    }
+
+    if (address == SMG3DS_LAYOUT_MANAGER_AFTER_NAME_FORMAT &&
+        guest_range_valid(cpu, cpu->gpr[29], 4u) &&
+        mem_read32(cpu, cpu->gpr[29]) == 0u) {
+        char layout_name[96];
+
+        guest_copy_string(cpu, cpu->gpr[30], layout_name,
+                          sizeof(layout_name));
+        if (g_debug_file != NULL) {
+            fprintf(g_debug_file,
+                    "LAYOUT_HOLDER_NULL this=%08lX name=%s sp=%08lX "
+                    "lr=%08lX async_missing=%lu/%08lX\n",
+                    (unsigned long)cpu->gpr[29],
+                    layout_name[0] != '\0' ? layout_name : "-",
+                    (unsigned long)cpu->gpr[1],
+                    (unsigned long)cpu->lr,
+                    (unsigned long)g_async_wait_missing_bypasses,
+                    (unsigned long)g_async_wait_missing_name);
+            fflush(g_debug_file);
+        }
+    }
+
+    if (address == SMG3DS_STRCASECMP) {
+        ++g_case_compare_fast_paths;
+        cpu->gpr[3] = guest_string_case_compare(
+            cpu, cpu->gpr[3], cpu->gpr[4]) == 0 ? 1u : 0u;
+        cpu->pc = cpu->lr & ~3u;
+        return 1;
+    }
+
+    if (address == SMG3DS_AUDIO_GROUP_RESOURCE_SETTER) {
+        const u32 destination = cpu->gpr[3];
+        const u32 resource = cpu->gpr[4];
+        const u32 count = guest_range_valid(cpu, resource, 4u) ?
+            mem_read32(cpu, resource) : 0xffffffffu;
+        const bool resource_valid =
+            resource != 0u && count <= 0x4000u &&
+            guest_range_valid(cpu, resource, 4u + count * 4u);
+
+        if (!resource_valid) {
+            ++g_audio_resource_skips;
+            g_audio_resource_bad_pointer = resource;
+            g_audio_resource_bad_count = count;
+            if (guest_range_valid(cpu, destination, 16u)) {
+                mem_write32(cpu, destination + 4u, 0u);
+                mem_write32(cpu, destination + 8u, 0u);
+                mem_write32(cpu, destination + 12u, 0u);
+            }
+            cpu->pc = cpu->lr & ~3u;
+            return 1;
+        }
+    }
+
+    if (address == SMG3DS_AUDIO_ME_RESOURCE_SETTER) {
+        const u32 destination = cpu->gpr[3] + 84u;
+        const u32 resource = cpu->gpr[4];
+        const u32 count = guest_range_valid(cpu, resource, 12u) ?
+            mem_read32(cpu, resource) : 0xffffffffu;
+        const u32 values_offset = guest_range_valid(cpu, resource, 12u) ?
+            mem_read32(cpu, resource + 4u) : 0u;
+        const u32 table_offset = guest_range_valid(cpu, resource, 12u) ?
+            mem_read32(cpu, resource + 8u) : 0u;
+        const bool resource_valid =
+            resource != 0u && count <= 0x4000u &&
+            values_offset <= 0x04000000u && table_offset <= 0x04000000u &&
+            guest_range_valid(cpu, resource + values_offset, 1u) &&
+            guest_range_valid(cpu, resource + table_offset, count * 4u);
+
+        if (!resource_valid) {
+            ++g_audio_resource_skips;
+            g_audio_resource_bad_pointer = resource;
+            g_audio_resource_bad_count = count;
+            if (guest_range_valid(cpu, destination, 12u)) {
+                mem_write32(cpu, destination, 0u);
+                mem_write32(cpu, destination + 4u, 0u);
+                mem_write32(cpu, destination + 8u, 0u);
+            }
+            cpu->pc = cpu->lr & ~3u;
+            return 1;
+        }
+    }
+
+    if (address == SMG3DS_ARCHIVE_REBUILD_RETURN &&
+        g_archive_rebuild_pending &&
+        mem_read32(cpu, 0x800000e4u) == g_archive_rebuild_thread) {
+        cpu->gpr[3] = g_archive_receive_loader;
+        cpu->gpr[4] = g_archive_receive_path;
+        cpu->lr = g_archive_receive_return;
+        g_archive_rebuild_pending = false;
+        cpu->pc = SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE;
+        return 1;
+    }
+
+    if (address == SMG3DS_AUDIO_SEQUENCE_RESOURCE_SETTER) {
+        const u32 destination = cpu->gpr[3];
+        const u32 resource = cpu->gpr[4];
+        const bool header_valid = guest_range_valid(cpu, resource, 16u);
+        const u32 count = header_valid ?
+            mem_read32(cpu, resource) : 0xffffffffu;
+        const u32 values_offset = header_valid ?
+            mem_read32(cpu, resource + 4u) : 0u;
+        const u32 table_offset = header_valid ?
+            mem_read32(cpu, resource + 8u) : 0u;
+        const u32 relocated = header_valid ?
+            mem_read32(cpu, resource + 12u) : 0u;
+        const bool resource_valid =
+            resource != 0u && count <= 0x4000u &&
+            values_offset <= 0x04000000u && table_offset <= 0x04000000u &&
+            guest_range_valid(cpu, resource + values_offset, 1u) &&
+            guest_range_valid(cpu, resource + table_offset,
+                              relocated != 0u ? 1u : count * 4u);
+
+        if (!resource_valid) {
+            ++g_audio_resource_skips;
+            g_audio_resource_bad_pointer = resource;
+            g_audio_resource_bad_count = count;
+            if (guest_range_valid(cpu, destination, 16u)) {
+                mem_write8(cpu, destination, 0u);
+                mem_write32(cpu, destination + 4u, 0u);
+                mem_write32(cpu, destination + 8u, 0u);
+                mem_write32(cpu, destination + 12u, 0u);
+            }
+            cpu->pc = cpu->lr & ~3u;
+            return 1;
+        }
+    }
+
+    if (address == SMG3DS_AUDIO_SEQUENCE_RESOURCE_LOOKUP_RETURN &&
+        cpu->gpr[3] == 0u) {
+        const u32 destination = cpu->gpr[31];
+        ++g_audio_resource_skips;
+        g_audio_resource_bad_pointer = 0u;
+        g_audio_resource_bad_count = 0xffffffffu;
+        if (guest_range_valid(cpu, destination, 16u)) {
+            mem_write8(cpu, destination, 0u);
+            mem_write32(cpu, destination + 4u, 0u);
+            mem_write32(cpu, destination + 8u, 0u);
+            mem_write32(cpu, destination + 12u, 0u);
+        }
+        cpu->pc = 0x80393798u;
+        return 1;
+    }
+
+    if (address == SMG3DS_FILE_LOADER_GET_MOUNTED_ARCHIVE_AND_HEAP) {
+        const u32 loader = cpu->gpr[3];
+        const u32 wanted_path = cpu->gpr[4];
+        const u32 archive_out = cpu->gpr[5];
+        const u32 heap_out = cpu->gpr[6];
+        const u32 holder = guest_range_valid(cpu, loader, 0x2cu) ?
+            mem_read32(cpu, loader + 0x28u) : 0u;
+        const u32 entry = archive_holder_find_entry_safe(
+            cpu, holder, wanted_path);
+
+        if (entry != 0u) {
+            if (guest_range_valid(cpu, archive_out, 4u))
+                mem_write32(cpu, archive_out, mem_read32(cpu, entry));
+            if (guest_range_valid(cpu, heap_out, 4u))
+                mem_write32(cpu, heap_out, mem_read32(cpu, entry + 4u));
+        }
+        cpu->pc = cpu->lr & ~3u;
+        return 1;
+    }
+
+    if (address == SMG3DS_FILE_LOADER_RECEIVE_FILE &&
+        g_file_wait_reentry_pending &&
+        mem_read32(cpu, 0x800000e4u) == g_file_wait_reentry_thread) {
+        cpu->gpr[3] = g_file_wait_reentry_loader;
+        cpu->gpr[4] = g_file_wait_reentry_path;
+        cpu->lr = SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE_WAIT_RETURN;
+        cpu->pc = SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE;
+        g_file_wait_reentry_pending = false;
+        return 1;
+    }
+
+    if (address == SMG3DS_FILE_HOLDER_WAIT_READ_DONE &&
+        guest_range_valid(cpu, cpu->gpr[3], 0x35u)) {
+        const u32 entry = cpu->gpr[3];
+        const u32 state = mem_read32(cpu, entry + 0x0cu);
+
+        ++g_file_wait_calls;
+        g_file_wait_entry = entry;
+        g_file_wait_state = state;
+        g_file_wait_context = mem_read32(cpu, entry + 4u);
+        g_file_wait_lr = cpu->lr;
+        g_file_wait_path[0] = '\0';
+        if (cpu->lr == SMG3DS_FILE_LOADER_RECEIVE_ALL_WAIT_RETURN &&
+            guest_range_valid(cpu, cpu->gpr[29], 0x24u)) {
+            const u32 infos = mem_read32(cpu, cpu->gpr[29] + 0x1cu);
+            const u32 info = infos + cpu->gpr[31];
+            if (guest_range_valid(cpu, info, 0x90u))
+                guest_copy_string(cpu, info + 8u, g_file_wait_path,
+                                  sizeof(g_file_wait_path));
+        } else {
+            guest_copy_string(cpu, cpu->gpr[31], g_file_wait_path,
+                              sizeof(g_file_wait_path));
+        }
+
+        if (cpu->lr == SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE_WAIT_RETURN &&
+            guest_range_valid(cpu, cpu->gpr[30], 0x2cu)) {
+            const u32 archive_holder = mem_read32(cpu, cpu->gpr[30] + 0x28u);
+            const u32 holder_entry = archive_holder_find_entry_safe(
+                cpu, archive_holder, cpu->gpr[31]);
+            const u32 archive = guest_range_valid(
+                cpu, holder_entry, 12u) ?
+                    mem_read32(cpu, holder_entry) : 0u;
+            if (archive != 0u) {
+                ++g_file_wait_mounted_bypasses;
+                cpu->gpr[3] = archive;
+                cpu->pc = SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE_LOOKUP_RETURN;
+                return 1;
+            }
+        }
+
+        /*
+         * setContext publishes mContext before it changes mState to READING.
+         * At that point the entry is complete; waitReadDone only consumes the
+         * one-slot notification and changes READING to DONE.  If the guest OS
+         * lost that notification during a scheduler handoff, blocking here can
+         * never make additional progress, so finish the equivalent state
+         * transition directly.
+         */
+        if (state == 1u) {
+            mem_write32(cpu, entry + 0x0cu, 2u);
+            ++g_file_wait_ready_bypasses;
+            cpu->pc = cpu->lr & ~3u;
+            return 1;
+        }
+
+        if (state > 2u &&
+            cpu->lr == SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE_WAIT_RETURN &&
+            g_file_wait_invalid_repairs < 32u) {
+            const u32 loader = cpu->gpr[30];
+            const u32 path = cpu->gpr[31];
+            const u32 infos = guest_range_valid(cpu, loader, 0x2cu) ?
+                mem_read32(cpu, loader + 0x1cu) : 0u;
+            u32 request_count = guest_range_valid(cpu, loader, 0x2cu) ?
+                mem_read32(cpu, loader + 0x20u) : 0u;
+            const u32 file_holder = guest_range_valid(cpu, loader, 0x2cu) ?
+                mem_read32(cpu, loader + 0x24u) : 0u;
+            const u32 file_entries =
+                guest_range_valid(cpu, file_holder, 12u) ?
+                    mem_read32(cpu, file_holder) : 0u;
+            u32 file_count = guest_range_valid(cpu, file_holder, 12u) ?
+                mem_read32(cpu, file_holder + 8u) : 0u;
+            s32 disc_entry = -1;
+            u32 matching_entry = 0u;
+
+            if (file_count > 384u)
+                file_count = 384u;
+            if (smg3ds_disc_resolve_path(cpu, path, &disc_entry) &&
+                guest_range_valid(cpu, file_entries, file_count * 4u)) {
+                for (u32 i = 0u; i < file_count; ++i) {
+                    const u32 candidate =
+                        mem_read32(cpu, file_entries + i * 4u);
+                    if (guest_range_valid(cpu, candidate, 0x38u) &&
+                        (s32)mem_read32(cpu, candidate) == disc_entry &&
+                        mem_read32(cpu, candidate + 0x0cu) <= 2u) {
+                        matching_entry = candidate;
+                        break;
+                    }
+                }
+            }
+
+            if (matching_entry != 0u) {
+                if (request_count > 0u && request_count <= 1024u &&
+                    guest_range_valid(cpu, infos, request_count * 0x90u)) {
+                    for (u32 i = 0u; i < request_count; ++i) {
+                        const u32 info = infos + i * 0x90u;
+                        char request_path[96];
+                        guest_copy_string(cpu, info + 8u, request_path,
+                                          sizeof(request_path));
+                        if (strcmp(request_path, g_file_wait_path) == 0) {
+                            mem_write32(cpu, info + 0x8cu,
+                                        matching_entry);
+                            break;
+                        }
+                    }
+                }
+                g_file_wait_reconciled_entry = matching_entry;
+                ++g_file_wait_invalid_repairs;
+                cpu->gpr[3] = matching_entry;
+                cpu->pc = SMG3DS_FILE_HOLDER_WAIT_READ_DONE;
+                return 1;
+            }
+
+            if (request_count > 0u && request_count <= 1024u &&
+                guest_range_valid(cpu, infos, request_count * 0x90u)) {
+                for (u32 i = 0u; i < request_count; ++i) {
+                    const u32 info = infos + i * 0x90u;
+                    char request_path[96];
+                    guest_copy_string(cpu, info + 8u, request_path,
+                                      sizeof(request_path));
+                    if (strcmp(request_path, g_file_wait_path) != 0)
+                        continue;
+                    for (u32 j = i; j + 1u < request_count; ++j) {
+                        const u32 dst = infos + j * 0x90u;
+                        const u32 src = dst + 0x90u;
+                        for (u32 offset = 0u; offset < 0x90u;
+                             offset += 4u) {
+                            mem_write32(cpu, dst + offset,
+                                        mem_read32(cpu, src + offset));
+                        }
+                    }
+                    --request_count;
+                    mem_write32(cpu, loader + 0x20u, request_count);
+                    break;
+                }
+            }
+
+            if (file_count > 0u && file_count <= 384u &&
+                guest_range_valid(cpu, file_entries, file_count * 4u)) {
+                for (u32 i = 0u; i < file_count; ++i) {
+                    if (mem_read32(cpu, file_entries + i * 4u) != entry)
+                        continue;
+                    for (u32 j = i; j + 1u < file_count; ++j) {
+                        mem_write32(cpu, file_entries + j * 4u,
+                                    mem_read32(cpu,
+                                               file_entries + (j + 1u) * 4u));
+                    }
+                    --file_count;
+                    mem_write32(cpu, file_holder + 8u, file_count);
+                    break;
+                }
+            }
+
+            ++g_file_wait_invalid_repairs;
+            g_file_wait_reentry_pending = true;
+            g_file_wait_reentry_thread = mem_read32(cpu, 0x800000e4u);
+            g_file_wait_reentry_loader = loader;
+            g_file_wait_reentry_path = path;
+            cpu->gpr[3] = loader;
+            cpu->gpr[4] = path;
+            cpu->gpr[5] = guest_stage_archive_heap(cpu);
+            cpu->gpr[6] = 0u;
+            cpu->lr = SMG3DS_FILE_LOADER_RECEIVE_FILE;
+            cpu->pc = SMG3DS_FILE_LOADER_REQUEST_MOUNT_ARCHIVE;
+            return 1;
+        }
+    }
+
+    if (address == SMG3DS_FILE_HOLDER_WAIT_READ_DONE &&
+        cpu->gpr[3] != 0u &&
+        cpu->lr == SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE_WAIT_RETURN) {
+        char archive_path[96];
+        /*
+         * receiveArchive's holder lookup lives in the same generated chunk as
+         * its wait return, so neither address normally passes through this
+         * dispatcher. Return through receiveFile's already-forced wait label
+         * instead; it gives us a safe point to skip corrupt holder entries.
+         */
+        guest_copy_string(cpu, cpu->gpr[31], archive_path,
+                          sizeof(archive_path));
+        if (archive_path[0] != '\0' &&
+            file_loader_core_valid(cpu, cpu->gpr[30])) {
+            g_archive_wait_redirect_pending = true;
+            g_archive_wait_redirect_thread = mem_read32(cpu, 0x800000e4u);
+            g_archive_wait_redirect_loader = cpu->gpr[30];
+            g_archive_wait_redirect_path = cpu->gpr[31];
+            ++g_archive_wait_redirects;
+            cpu->lr = SMG3DS_FILE_LOADER_RECEIVE_WAIT_RETURN;
+        }
+    }
+
+    if ((address == SMG3DS_FILE_LOADER_RECEIVE_WAIT_RETURN ||
+         (address == SMG3DS_FILE_HOLDER_WAIT_READ_DONE &&
+          cpu->gpr[3] == 0u)) &&
+        g_archive_wait_redirect_pending &&
+        mem_read32(cpu, 0x800000e4u) == g_archive_wait_redirect_thread) {
+        const u32 archive_holder =
+            guest_range_valid(cpu, g_archive_wait_redirect_loader, 0x2cu) ?
+                mem_read32(cpu, g_archive_wait_redirect_loader + 0x28u) : 0u;
+        const u32 holder_entry = archive_holder_find_entry_safe(
+            cpu, archive_holder, g_archive_wait_redirect_path);
+        const u32 archive = guest_range_valid(
+            cpu, holder_entry, 12u) ?
+                mem_read32(cpu, holder_entry) : 0u;
+        /*
+         * A generated receiveArchive block can call waitReadDone again before
+         * its redirected return address reaches the dispatcher. Complete the
+         * already-validated holder lookup here, ahead of the generic null-file
+         * retry, once the archive publisher has made the entry visible.
+         */
+        if (archive != 0u ||
+            address == SMG3DS_FILE_LOADER_RECEIVE_WAIT_RETURN) {
+            cpu->gpr[3] = archive;
+            g_archive_wait_redirect_pending = false;
+            g_file_holder_retry_pending = false;
+            cpu->pc = SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE_LOOKUP_RETURN;
+            return 1;
+        }
+    }
+
+    if (address == SMG3DS_FILE_HOLDER_WAIT_READ_DONE &&
+        cpu->gpr[3] == 0u) {
+        /*
+         * receiveFile, receiveArchive, and receiveAllRequestedFile share the
+         * same publication race: addRequest increments the visible request
+         * count before its caller stores RequestFileInfo::mFileEntry. Never
+         * let waitReadDone turn a null entry into the unsignalable queue at
+         * address 0x18. Re-enter the owning receive operation and use a VI
+         * interrupt to let the preempted publisher finish first.
+         */
+        ++g_file_holder_null_wait_retries;
+        g_file_holder_null_wait_lr = cpu->lr;
+        if (!vi_interrupt_pending())
+            signal_video_retrace();
+        if (cpu->lr == SMG3DS_FILE_LOADER_RECEIVE_WAIT_RETURN ||
+            cpu->lr == SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE_WAIT_RETURN) {
+            g_file_holder_retry_pending = true;
+            g_file_holder_retry_thread =
+                mem_read32(cpu, 0x800000e4u);
+            g_file_holder_retry_return = cpu->lr;
+            g_file_holder_retry_loader = cpu->gpr[30];
+            g_file_holder_retry_path = cpu->gpr[31];
+            cpu->gpr[3] = g_file_holder_retry_loader;
+            cpu->gpr[4] = g_file_holder_retry_path;
+            cpu->lr = SMG3DS_FILE_LOADER_RECEIVE_INFO_RETURN;
+            cpu->pc = SMG3DS_FILE_LOADER_GET_REQUEST_INFO;
+            return 1;
+        }
+        if (cpu->lr == SMG3DS_FILE_LOADER_RECEIVE_ALL_WAIT_RETURN) {
+            const u32 infos = mem_read32(cpu, cpu->gpr[29] + 0x1cu);
+            const u32 info = infos + cpu->gpr[31];
+            const u32 entry = guest_range_valid(cpu, info, 0x90u) ?
+                mem_read32(cpu, info + 0x8cu) : 0u;
+            if (entry != 0u)
+                cpu->gpr[3] = entry;
+            cpu->pc = SMG3DS_FILE_HOLDER_WAIT_READ_DONE;
+            return 1;
+        }
+        cpu->pc = SMG3DS_FILE_HOLDER_WAIT_READ_DONE;
+        return 1;
+    }
+
+    if (address == SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE) {
+        char path[96];
+        const u32 current_thread = mem_read32(cpu, 0x800000e4u);
+        if (g_archive_holder_rebuild_state != 0u &&
+            current_thread == g_archive_holder_rebuild_thread) {
+            if (g_archive_holder_rebuild_state == 1u &&
+                cpu->gpr[3] != 0u) {
+                g_archive_holder_after = cpu->gpr[3];
+                g_archive_holder_rebuild_state = 2u;
+                cpu->lr = SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE;
+                cpu->pc = SMG3DS_ARCHIVE_HOLDER_CTOR;
+                return 1;
+            }
+            if (g_archive_holder_rebuild_state == 2u &&
+                guest_range_valid(cpu, cpu->gpr[3], 12u)) {
+                g_archive_holder_after = cpu->gpr[3];
+                mem_write32(cpu, g_archive_receive_loader + 0x28u,
+                            g_archive_holder_after);
+            }
+            g_archive_holder_rebuild_state = 0u;
+            cpu->gpr[3] = g_archive_receive_loader;
+            cpu->gpr[4] = g_archive_receive_path;
+            cpu->lr = g_archive_receive_return;
+        }
+        if (g_archive_receive_priority_state != 0u &&
+            current_thread == g_archive_receive_thread) {
+            cpu->gpr[3] = g_archive_receive_loader;
+            cpu->gpr[4] = g_archive_receive_path;
+            if (g_archive_receive_priority_state == 2u)
+                cpu->lr = g_archive_receive_return;
+        }
+        if (g_archive_repair_send_pending &&
+            current_thread == g_archive_receive_thread) {
+            cpu->gpr[3] = g_archive_receive_loader;
+            cpu->gpr[4] = g_archive_receive_path;
+            cpu->lr = g_archive_receive_return;
+            g_archive_repair_send_pending = false;
+        }
+        cpu->gpr[3] = reconcile_file_loader_identity(cpu, cpu->gpr[3]);
+        guest_copy_string(cpu, cpu->gpr[4], path, sizeof(path));
+        if (!g_archive_rebuild_pending &&
+            g_archive_holder_rebuild_state == 0u &&
+            strcmp(path, g_archive_recovery_path) != 0) {
+            snprintf(g_archive_recovery_path,
+                     sizeof(g_archive_recovery_path), "%s", path);
+            g_archive_rebuild_attempts = 0u;
+            g_archive_holder_rebuild_attempts = 0u;
+        }
+        if (path[0] != '\0' && file_loader_core_valid(cpu, cpu->gpr[3]) &&
+            !file_loader_archive_mounted(cpu, cpu->gpr[3], cpu->gpr[4])) {
+            const u32 loader = cpu->gpr[3];
+            const u32 archive_holder =
+                guest_range_valid(cpu, loader, 0x2cu) ?
+                    mem_read32(cpu, loader + 0x28u) : 0u;
+            const u32 archive_vector =
+                guest_range_valid(cpu, archive_holder, 12u) ?
+                    mem_read32(cpu, archive_holder) : 0u;
+            const u32 archive_capacity =
+                guest_range_valid(cpu, archive_holder, 12u) ?
+                    mem_read32(cpu, archive_holder + 4u) : 0u;
+            const u32 archive_count =
+                guest_range_valid(cpu, archive_holder, 12u) ?
+                    mem_read32(cpu, archive_holder + 8u) : 0u;
+            const bool archive_holder_valid =
+                guest_range_valid(cpu, archive_holder, 36u) &&
+                archive_capacity == 384u &&
+                archive_count <= archive_capacity &&
+                guest_range_valid(cpu, archive_vector,
+                                  archive_capacity * 4u);
+            g_archive_holder_before = archive_holder;
+            g_archive_holder_vector = archive_vector;
+            g_archive_holder_capacity = archive_capacity;
+            g_archive_holder_count = archive_count;
+            if (!archive_holder_valid &&
+                g_archive_holder_rebuild_attempts < 3u) {
+                g_archive_receive_loader = loader;
+                g_archive_receive_path = cpu->gpr[4];
+                g_archive_receive_return = cpu->lr;
+                g_archive_holder_rebuild_thread = current_thread;
+                ++g_archive_holder_rebuild_attempts;
+                /* Never run the constructor through a non-null bad pointer. */
+                g_archive_holder_rebuild_state = 1u;
+                cpu->gpr[3] = 36u;
+                cpu->pc = SMG3DS_OPERATOR_NEW;
+                cpu->lr = SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE;
+                return 1;
+            }
+            const u32 infos = guest_range_valid(cpu, loader, 0x24u) ?
+                mem_read32(cpu, loader + 0x1cu) : 0u;
+            u32 count = guest_range_valid(cpu, loader, 0x24u) ?
+                mem_read32(cpu, loader + 0x20u) : 0u;
+            u32 entry = 0u;
+            u32 request_info = 0u;
+            bool found = false;
+            for (u32 i = 0u; i < count && i < 1024u; ++i) {
+                const u32 info = infos + i * 0x90u;
+                char request_path[96];
+                if (!guest_range_valid(cpu, info, 0x90u))
+                    break;
+                guest_copy_string(cpu, info + 8u, request_path,
+                                  sizeof(request_path));
+                if (strcmp(request_path, path) == 0) {
+                    found = true;
+                    request_info = info;
+                    entry = mem_read32(cpu, info + 0x8cu);
+                    break;
+                }
+            }
+            if (found && entry == 0u) {
+                s32 disc_entry = -1;
+                const u32 file_holder =
+                    mem_read32(cpu, loader + 0x24u);
+                const u32 file_entries =
+                    guest_range_valid(cpu, file_holder, 12u) ?
+                        mem_read32(cpu, file_holder) : 0u;
+                const u32 holder_count =
+                    guest_range_valid(cpu, file_holder, 12u) ?
+                        mem_read32(cpu, file_holder + 8u) : 0u;
+                u32 file_count = holder_count;
+                u32 matching_entry = 0u;
+                if (file_count > 384u)
+                    file_count = 384u;
+                if (smg3ds_disc_resolve_path(cpu, cpu->gpr[4],
+                                             &disc_entry)) {
+                    for (u32 i = 0u; i < file_count; ++i) {
+                        const u32 candidate =
+                            mem_read32(cpu, file_entries + i * 4u);
+                        if (guest_range_valid(cpu, candidate, 0x38u) &&
+                            (s32)mem_read32(cpu, candidate) ==
+                                disc_entry) {
+                            matching_entry = candidate;
+                            break;
+                        }
+                    }
+                }
+                g_archive_repair_info = request_info;
+                g_archive_repair_file_entry = matching_entry;
+                if (matching_entry != 0u) {
+                    mem_write32(cpu, request_info + 0x8cu,
+                                matching_entry);
+                    entry = matching_entry;
+                    if (mem_read32(cpu, matching_entry + 4u) == 0u &&
+                        mem_read32(cpu, matching_entry + 0x0cu) == 0u) {
+                        g_archive_receive_thread = current_thread;
+                        g_archive_receive_loader = cpu->gpr[3];
+                        g_archive_receive_path = cpu->gpr[4];
+                        g_archive_receive_return = cpu->lr;
+                        g_archive_repair_send_pending = true;
+                        ++g_archive_repair_submissions;
+                        cpu->gpr[3] =
+                            mem_read32(cpu, loader) + 8u;
+                        cpu->gpr[4] = request_info;
+                        cpu->gpr[5] = 0u;
+                        cpu->lr =
+                            SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE;
+                        cpu->pc = SMG3DS_OS_SEND_MESSAGE;
+                        return 1;
+                    }
+                }
+
+                /*
+                 * The publisher can be stranded after addRequest made the
+                 * RequestFileInfo visible but before FileHolder::add stored
+                 * its entry. Remove that incomplete fixed-array record, trim
+                 * a failed trailing FileHolder allocation if one exists, and
+                 * invoke the game's normal requestMountArchive path again on
+                 * this thread. That recreates both objects and submits the
+                 * loader message atomically from the receiver's perspective.
+                 */
+                if (g_archive_rebuild_attempts < 3u) {
+                    const u32 orphan_index =
+                        (request_info - infos) / 0x90u;
+                    if (count <= 1024u && orphan_index < count) {
+                        for (u32 i = orphan_index; i + 1u < count; ++i) {
+                            const u32 dst = infos + i * 0x90u;
+                            const u32 src = dst + 0x90u;
+                            for (u32 offset = 0u; offset < 0x90u;
+                                 offset += 4u) {
+                                mem_write32(cpu, dst + offset,
+                                            mem_read32(cpu, src + offset));
+                            }
+                        }
+                        --count;
+                        mem_write32(cpu, loader + 0x20u, count);
+                    } else {
+                        mem_write8(cpu, request_info + 8u, 0u);
+                    }
+
+                    g_archive_rebuild_file_count = holder_count;
+                    if (holder_count > 0u && holder_count <= 384u &&
+                        guest_range_valid(cpu, file_entries,
+                                          holder_count * 4u) &&
+                        mem_read32(cpu, file_entries +
+                                         (holder_count - 1u) * 4u) == 0u) {
+                        g_archive_rebuild_file_count = holder_count - 1u;
+                        mem_write32(cpu, file_holder + 8u,
+                                    g_archive_rebuild_file_count);
+                    }
+
+                    g_archive_receive_thread = current_thread;
+                    g_archive_receive_loader = loader;
+                    g_archive_receive_path = cpu->gpr[4];
+                    g_archive_receive_return = cpu->lr;
+                    g_archive_rebuild_thread = current_thread;
+                    g_archive_rebuild_orphan_index = orphan_index;
+                    g_archive_rebuild_pending = true;
+                    ++g_archive_rebuild_attempts;
+                    cpu->gpr[3] = loader;
+                    cpu->gpr[4] = g_archive_receive_path;
+                    g_archive_rebuild_heap = guest_stage_archive_heap(cpu);
+                    cpu->gpr[5] = g_archive_rebuild_heap;
+                    cpu->gpr[6] = 0u;
+                    cpu->lr = SMG3DS_ARCHIVE_REBUILD_RETURN;
+                    cpu->pc = SMG3DS_FILE_LOADER_REQUEST_MOUNT_ARCHIVE;
+                    return 1;
+                }
+            }
+            if (!found && g_archive_rebuild_attempts < 3u) {
+                const u32 file_holder =
+                    mem_read32(cpu, loader + 0x24u);
+                const u32 file_entries =
+                    guest_range_valid(cpu, file_holder, 12u) ?
+                        mem_read32(cpu, file_holder) : 0u;
+                const u32 holder_count =
+                    guest_range_valid(cpu, file_holder, 12u) ?
+                        mem_read32(cpu, file_holder + 8u) : 0u;
+
+                g_archive_rebuild_file_count = holder_count;
+                if (holder_count > 0u && holder_count <= 384u &&
+                    guest_range_valid(cpu, file_entries,
+                                      holder_count * 4u) &&
+                    mem_read32(cpu, file_entries +
+                                     (holder_count - 1u) * 4u) == 0u) {
+                    g_archive_rebuild_file_count = holder_count - 1u;
+                    mem_write32(cpu, file_holder + 8u,
+                                g_archive_rebuild_file_count);
+                }
+
+                g_archive_receive_thread = current_thread;
+                g_archive_receive_loader = loader;
+                g_archive_receive_path = cpu->gpr[4];
+                g_archive_receive_return = cpu->lr;
+                g_archive_rebuild_thread = current_thread;
+                g_archive_rebuild_orphan_index = 0xffffffffu;
+                g_archive_rebuild_pending = true;
+                ++g_archive_rebuild_attempts;
+                cpu->gpr[3] = loader;
+                cpu->gpr[4] = g_archive_receive_path;
+                g_archive_rebuild_heap = guest_stage_archive_heap(cpu);
+                cpu->gpr[5] = g_archive_rebuild_heap;
+                cpu->gpr[6] = 0u;
+                cpu->lr = SMG3DS_ARCHIVE_REBUILD_RETURN;
+                cpu->pc = SMG3DS_FILE_LOADER_REQUEST_MOUNT_ARCHIVE;
+                return 1;
+            }
+            if (!found || entry == 0u) {
+                ++g_archive_receive_preflight_retries;
+                if (g_archive_receive_priority_state == 0u &&
+                    guest_range_valid(cpu, current_thread, 0x2d8u)) {
+                    g_archive_receive_priority_state = 1u;
+                    g_archive_receive_thread = current_thread;
+                    g_archive_receive_original_priority =
+                        mem_read32(cpu, current_thread + 0x2d4u);
+                    g_archive_receive_loader = cpu->gpr[3];
+                    g_archive_receive_path = cpu->gpr[4];
+                    g_archive_receive_return = cpu->lr;
+                    cpu->gpr[3] = current_thread;
+                    cpu->gpr[4] = 31u;
+                    cpu->lr = SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE;
+                    cpu->pc = SMG3DS_OS_SET_THREAD_PRIORITY;
+                } else {
+                    cpu->lr = SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE;
+                    cpu->pc = SMG3DS_OS_YIELD_THREAD;
+                }
+                return 1;
+            }
+            if (g_archive_receive_priority_state == 1u &&
+                current_thread == g_archive_receive_thread) {
+                const u32 current_thread = g_archive_receive_thread;
+                const u32 original_priority =
+                    g_archive_receive_original_priority;
+                g_archive_receive_priority_state = 2u;
+                cpu->gpr[3] = current_thread;
+                cpu->gpr[4] = original_priority;
+                cpu->lr = SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE;
+                cpu->pc = SMG3DS_OS_SET_THREAD_PRIORITY;
+                return 1;
+            }
+            if (g_archive_receive_priority_state == 2u &&
+                current_thread == g_archive_receive_thread)
+                g_archive_receive_priority_state = 0u;
+        }
+    }
+
+    if (address == SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE_WAIT_RETURN) {
+        const u32 loader = cpu->gpr[30];
+        const u32 archive_holder =
+            guest_range_valid(cpu, loader, 0x2cu) ?
+                mem_read32(cpu, loader + 0x28u) : 0u;
+        const u32 holder_entry =
+            archive_holder_find_entry_safe(cpu, archive_holder,
+                                           cpu->gpr[31]);
+        cpu->gpr[3] =
+            holder_entry != 0u &&
+            guest_range_valid(cpu, holder_entry, 12u) ?
+                mem_read32(cpu, holder_entry) : 0u;
+        cpu->pc = SMG3DS_FILE_LOADER_RECEIVE_ARCHIVE_LOOKUP_RETURN;
+        return 1;
+    }
+
+    if (address == SMG3DS_ARCHIVE_HOLDER_FIND_ENTRY) {
+        const u32 holder = cpu->gpr[3];
+        const u32 wanted_path = cpu->gpr[4];
+        cpu->gpr[3] = archive_holder_find_entry_safe(
+            cpu, holder, wanted_path);
+        cpu->pc = cpu->lr & ~3u;
+        return 1;
+    }
+
+    if (address == SMG3DS_FILE_LOADER_RECEIVE_FILE) {
+        char path[96];
+        guest_copy_string(cpu, cpu->gpr[4], path, sizeof(path));
+        if (strcmp(path, "/StageData/FileSelect.arc") == 0) {
+            ++g_file_select_receives;
+            g_file_select_request_info = 0u;
+            g_file_select_entry = 0u;
+            g_file_select_context_before = 0u;
+            g_file_select_state_before = 0u;
+            g_file_select_queue_before = 0u;
+            g_file_select_set_context = 0u;
+            g_file_select_set_calls = 0u;
+            g_file_select_context_after = 0u;
+            g_file_select_state_after = 0u;
+            g_file_select_queue_after = 0u;
+            g_file_select_wait_repairs = 0u;
+        }
+    } else if (address == SMG3DS_FILE_LOADER_RECEIVE_INFO_RETURN) {
+        if (g_file_holder_retry_pending &&
+            mem_read32(cpu, 0x800000e4u) ==
+                g_file_holder_retry_thread) {
+            const u32 info = cpu->gpr[3];
+            const u32 entry = guest_range_valid(cpu, info, 0x90u) ?
+                mem_read32(cpu, info + 0x8cu) : 0u;
+            if (entry == 0u) {
+                if (!vi_interrupt_pending())
+                    signal_video_retrace();
+                cpu->gpr[3] = g_file_holder_retry_loader;
+                cpu->gpr[4] = g_file_holder_retry_path;
+                cpu->lr = SMG3DS_FILE_LOADER_RECEIVE_INFO_RETURN;
+                cpu->pc = SMG3DS_FILE_LOADER_GET_REQUEST_INFO;
+                return 1;
+            }
+            cpu->gpr[3] = entry;
+            cpu->lr = g_file_holder_retry_return;
+            cpu->pc = SMG3DS_FILE_HOLDER_WAIT_READ_DONE;
+            g_file_holder_retry_pending = false;
+            return 1;
+        }
+        char path[96];
+        guest_copy_string(cpu, cpu->gpr[31], path, sizeof(path));
+        if (strcmp(path, "/StageData/FileSelect.arc") == 0) {
+            g_file_select_request_info = cpu->gpr[3];
+            if (guest_range_valid(cpu, cpu->gpr[3], 0x90u))
+                g_file_select_entry = mem_read32(cpu, cpu->gpr[3] + 0x8cu);
+        }
+    } else if (address == SMG3DS_FILE_HOLDER_WAIT_READ_DONE &&
+               cpu->gpr[3] == g_file_select_entry) {
+        g_file_select_context_before = mem_read32(cpu, cpu->gpr[3] + 4u);
+        g_file_select_state_before = mem_read32(cpu, cpu->gpr[3] + 0x0cu);
+        g_file_select_queue_before = mem_read32(cpu, cpu->gpr[3] + 0x2cu);
+    } else if (address == SMG3DS_FILE_HOLDER_SET_CONTEXT &&
+               cpu->gpr[3] == g_file_select_entry) {
+        g_file_select_set_context = cpu->gpr[4];
+        ++g_file_select_set_calls;
+    } else if (address == SMG3DS_FILE_LOADER_RECEIVE_WAIT_RETURN) {
+        char path[96];
+        guest_copy_string(cpu, cpu->gpr[31], path, sizeof(path));
+        if (strcmp(path, "/StageData/FileSelect.arc") == 0 &&
+            guest_range_valid(cpu, g_file_select_entry, 0x30u)) {
+            g_file_select_context_after =
+                mem_read32(cpu, g_file_select_entry + 4u);
+            g_file_select_state_after =
+                mem_read32(cpu, g_file_select_entry + 0x0cu);
+            g_file_select_queue_after =
+                mem_read32(cpu, g_file_select_entry + 0x2cu);
+        }
+    }
+
+    if (address == SMG3DS_STAGE_ARCHIVE_LOOKUP) {
+        guest_copy_string(cpu, cpu->gpr[3], g_last_stage_archive,
+                          sizeof(g_last_stage_archive));
+        ++g_stage_archive_requests;
+    }
+
+    if (service_yaz0_decompression(cpu) ||
+        service_optional_platform_module(cpu) ||
+        service_coherent_cache_range(cpu))
+        return 1;
+
     s32 entry_index;
     bool opened;
 
@@ -410,14 +2405,6 @@ int dolrecomp_dispatch_replacement(CPUState* cpu, u32 address)
 
     if (smg3ds_petari_dispatch(cpu, address))
         return 1;
-
-    if (address == SMG3DS_MR_IS_EQUAL_STRING_CASE) {
-        cpu->gpr[3] = guest_strings_equal_case(cpu, cpu->gpr[3],
-                                                 cpu->gpr[4]) ? 1u : 0u;
-        cpu->pc = cpu->lr & ~3u;
-        ++g_case_compare_fast_paths;
-        return 1;
-    }
 
     if (address == SMG3DS_DVD_CONVERT_PATH_TO_ENTRYNUM) {
         if (!smg3ds_disc_resolve_path(cpu, cpu->gpr[3], &entry_index))
@@ -537,6 +2524,8 @@ static bool report_guest_panic(CPUState* cpu)
 
     if (!decode_guest_panic(cpu, &panic))
         return false;
+    if (panic.caller == 0x8040a02cu && panic.arguments[2] != 0u)
+        panic.asset_path_address = panic.arguments[2];
     guest_copy_string(cpu, panic.file_address, file, sizeof(file));
     guest_copy_string(cpu, panic.message_address, message, sizeof(message));
     asset_path[0] = '\0';
@@ -555,6 +2544,54 @@ static bool report_guest_panic(CPUState* cpu)
             (unsigned long)panic.arguments[2],
             (unsigned long)panic.arguments[3],
             (unsigned long)panic.arguments[4]);
+    }
+    if (length > 0 && length < (int)sizeof(report) &&
+        (panic.caller == 0x8040a02cu ||
+         panic.caller == 0x8040ba48u)) {
+        u32 frame = cpu->gpr[1];
+        const u32 allocator_frame = guest_range_valid(cpu, frame, 4u) ?
+            mem_read32(cpu, frame) : frame;
+        const u32 heap = guest_range_valid(cpu, allocator_frame, 32u) ?
+            mem_read32(cpu, allocator_frame + 16u) : 0u;
+        const u32 alloc_size = guest_range_valid(cpu, allocator_frame, 32u) ?
+            mem_read32(cpu, allocator_frame + 20u) : 0u;
+        const u32 alloc_align = guest_range_valid(cpu, allocator_frame, 32u) ?
+            mem_read32(cpu, allocator_frame + 24u) : 0u;
+        const u32 alloc_result = guest_range_valid(cpu, allocator_frame, 32u) ?
+            mem_read32(cpu, allocator_frame + 28u) : 0u;
+        const u32 heap_size = guest_range_valid(cpu, heap, 112u) ?
+            mem_read32(cpu, heap + 56u) : 0u;
+        const u32 heap_free = guest_range_valid(cpu, heap, 112u) ?
+            mem_read32(cpu, heap + 108u) : 0u;
+        length += snprintf(report + length, sizeof(report) - (size_t)length,
+            "alloc: sp=%08lX heap=%08lX size=%08lX align=%08lX result=%08lX "
+            "capacity=%08lX free=%08lX\n",
+            (unsigned long)allocator_frame, (unsigned long)heap,
+            (unsigned long)alloc_size, (unsigned long)alloc_align,
+            (unsigned long)alloc_result, (unsigned long)heap_size,
+            (unsigned long)heap_free);
+        if (length > 0 && length < (int)sizeof(report) &&
+            guest_range_valid(cpu, frame, 40u)) {
+            length += snprintf(report + length,
+                sizeof(report) - (size_t)length,
+                "trace: %08lX", (unsigned long)mem_read32(cpu, frame + 36u));
+            frame = mem_read32(cpu, frame);
+            for (u32 depth = 0u;
+                 depth < 10u && length > 0 && length < (int)sizeof(report) &&
+                 guest_range_valid(cpu, frame, 8u);
+                 ++depth) {
+                const u32 next = mem_read32(cpu, frame);
+                length += snprintf(report + length,
+                    sizeof(report) - (size_t)length,
+                    " %08lX", (unsigned long)mem_read32(cpu, frame + 4u));
+                if (next <= frame || (next & 3u) != 0u)
+                    break;
+                frame = next;
+            }
+            if (length > 0 && length < (int)sizeof(report))
+                length += snprintf(report + length,
+                    sizeof(report) - (size_t)length, "\n");
+        }
     }
     if (length > 0 && length < (int)sizeof(report) &&
         panic.asset_path_address != 0u) {
@@ -768,7 +2805,7 @@ static void ai_write_control(CPUState* cpu, u32 value)
         g_ai_control |= interrupt_status;
 }
 
-static bool mem2_offset(uint32_t address, uint8_t size, uint32_t* offset)
+static bool mem2_offset(uint32_t address, uint32_t size, uint32_t* offset)
 {
     const uint32_t physical = mmio_physical(address);
     if (physical < 0x10000000u ||
@@ -778,44 +2815,273 @@ static bool mem2_offset(uint32_t address, uint8_t size, uint32_t* offset)
     return true;
 }
 
+static uint8_t* mem2_restore_page(uint32_t page);
+
+static void mem2_initialize(void)
+{
+    uint32_t page;
+    for (page = 0u; page < SMG3DS_MEM2_PAGE_COUNT; ++page)
+        g_mem2_swap_slots[page] = (uint16_t)SMG3DS_MEM2_SWAP_SLOT_NONE;
+}
+
+static bool mem2_swap_open(void)
+{
+    g_mem2_swap_file = fopen("sdmc:/smg3ds-mem2.swap", "w+b");
+    if (g_mem2_swap_file == NULL)
+        return false;
+    setvbuf(g_mem2_swap_file, NULL, _IONBF, 0);
+    return true;
+}
+
+static void mem2_touch_page(uint32_t page)
+{
+    g_mem2_page_last_use[page] = ++g_mem2_page_clock;
+}
+
+static uint8_t* mem2_access_page(uint32_t page)
+{
+    uint8_t* data = g_mem2_pages[page];
+    if (data == NULL &&
+        g_mem2_swap_slots[page] != SMG3DS_MEM2_SWAP_SLOT_NONE)
+        data = mem2_restore_page(page);
+    if (data != NULL)
+        mem2_touch_page(page);
+    return data;
+}
+
 static uint64_t mem2_read_sparse(uint32_t offset, uint8_t size)
 {
     uint64_t value = 0;
     uint8_t i;
+    const uint32_t page = offset >> SMG3DS_MEM2_PAGE_SHIFT;
+    const uint32_t in_page = offset & (SMG3DS_MEM2_PAGE_SIZE - 1u);
+    const uint8_t* data;
+
+    if (size <= SMG3DS_MEM2_PAGE_SIZE - in_page) {
+        data = mem2_access_page(page);
+        if (data == NULL)
+            return 0u;
+        data += in_page;
+        if (size == 1u)
+            return data[0];
+        if (size == 2u)
+            return read_be16(data);
+        if (size == 4u)
+            return read_be32(data);
+        if (size == 8u)
+            return read_be64(data);
+    }
     for (i = 0; i < size; ++i) {
         const uint32_t current = offset + i;
         const uint32_t page = current >> SMG3DS_MEM2_PAGE_SHIFT;
         const uint32_t in_page = current & (SMG3DS_MEM2_PAGE_SIZE - 1u);
-        const uint8_t byte = g_mem2_pages[page] == NULL ? 0u :
-                             g_mem2_pages[page][in_page];
+        const uint8_t* data = mem2_access_page(page);
+        const uint8_t byte = data == NULL ? 0u : data[in_page];
         value = (value << 8) | byte;
     }
     return value;
 }
 
+static void mem2_release_page(uint32_t page)
+{
+    if (g_mem2_pages[page] == NULL)
+        return;
+    if (g_mem2_pages_normal[page])
+        free(g_mem2_pages[page]);
+    else
+        linearFree(g_mem2_pages[page]);
+    g_mem2_pages[page] = NULL;
+    g_mem2_pages_normal[page] = false;
+    --g_mem2_pages_used;
+}
+
+static uint32_t mem2_reclaim_zero_pages(void)
+{
+    uint32_t page;
+    uint32_t reclaimed = 0u;
+
+    for (page = 0u; page < SMG3DS_MEM2_PAGE_COUNT; ++page) {
+        uint32_t offset;
+        uint8_t* data = g_mem2_pages[page];
+        if (data == NULL)
+            continue;
+        for (offset = 0u; offset < SMG3DS_MEM2_PAGE_SIZE; ++offset) {
+            if (data[offset] != 0u)
+                break;
+        }
+        if (offset != SMG3DS_MEM2_PAGE_SIZE)
+            continue;
+        g_mem2_swap_slots[page] = (uint16_t)SMG3DS_MEM2_SWAP_SLOT_NONE;
+        g_mem2_pages_dirty[page] = false;
+        mem2_release_page(page);
+        ++reclaimed;
+    }
+    g_mem2_pages_reclaimed += reclaimed;
+    return reclaimed;
+}
+
+static bool mem2_write_swap_page(uint32_t page)
+{
+    uint16_t slot = g_mem2_swap_slots[page];
+    bool new_slot = false;
+
+    if (g_mem2_swap_file == NULL)
+        return false;
+    if (slot == SMG3DS_MEM2_SWAP_SLOT_NONE) {
+        if (g_mem2_swap_slots_used >= SMG3DS_MEM2_PAGE_COUNT)
+            return false;
+        slot = (uint16_t)g_mem2_swap_slots_used++;
+        g_mem2_swap_slots[page] = slot;
+        new_slot = true;
+    } else if (!g_mem2_pages_dirty[page]) {
+        return true;
+    }
+    if (fseek(g_mem2_swap_file,
+              (long)((uint32_t)slot * SMG3DS_MEM2_PAGE_SIZE), SEEK_SET) != 0 ||
+        fwrite(g_mem2_pages[page], 1u, SMG3DS_MEM2_PAGE_SIZE,
+               g_mem2_swap_file) != SMG3DS_MEM2_PAGE_SIZE) {
+        if (new_slot) {
+            g_mem2_swap_slots[page] =
+                (uint16_t)SMG3DS_MEM2_SWAP_SLOT_NONE;
+            --g_mem2_swap_slots_used;
+        }
+        ++g_mem2_swap_failures;
+        return false;
+    }
+    g_mem2_pages_dirty[page] = false;
+    return true;
+}
+
+static bool mem2_evict_page(uint32_t avoid_page)
+{
+    uint32_t page;
+    uint32_t oldest_page = SMG3DS_MEM2_PAGE_COUNT;
+    uint32_t oldest_use = 0xffffffffu;
+
+    for (page = 0u; page < SMG3DS_MEM2_PAGE_COUNT; ++page) {
+        if (page == avoid_page || g_mem2_pages[page] == NULL)
+            continue;
+        if (g_mem2_page_last_use[page] < oldest_use) {
+            oldest_page = page;
+            oldest_use = g_mem2_page_last_use[page];
+        }
+    }
+    if (oldest_page == SMG3DS_MEM2_PAGE_COUNT ||
+        !mem2_write_swap_page(oldest_page))
+        return false;
+    mem2_release_page(oldest_page);
+    ++g_mem2_pages_evicted;
+    return true;
+}
+
+static uint8_t* mem2_allocate_page(uint32_t page)
+{
+    uint8_t* data;
+    bool normal = false;
+    uint32_t attempt;
+
+    for (attempt = 0u; attempt < 3u; ++attempt) {
+        data = (uint8_t*)linearMemAlign(SMG3DS_MEM2_PAGE_SIZE, 0x80u);
+        normal = false;
+        if (data == NULL) {
+            data = (uint8_t*)calloc(1, SMG3DS_MEM2_PAGE_SIZE);
+            normal = data != NULL;
+        }
+        if (data != NULL)
+            break;
+        if (attempt == 0u && mem2_reclaim_zero_pages() != 0u)
+            continue;
+        if (!mem2_evict_page(page))
+            break;
+    }
+
+    g_mem2_pages_normal[page] = normal;
+    if (data != NULL && !normal)
+        memset(data, 0, SMG3DS_MEM2_PAGE_SIZE);
+    if (data == NULL) {
+        g_mem2_out_of_memory = true;
+        return NULL;
+    }
+    g_mem2_pages[page] = data;
+    g_mem2_pages_dirty[page] = false;
+    mem2_touch_page(page);
+    ++g_mem2_pages_used;
+    return data;
+}
+
+static uint8_t* mem2_restore_page(uint32_t page)
+{
+    const uint16_t slot = g_mem2_swap_slots[page];
+    uint8_t* data;
+
+    if (slot == SMG3DS_MEM2_SWAP_SLOT_NONE || g_mem2_swap_file == NULL)
+        return NULL;
+    data = mem2_allocate_page(page);
+    if (data == NULL)
+        return NULL;
+    if (fseek(g_mem2_swap_file,
+              (long)((uint32_t)slot * SMG3DS_MEM2_PAGE_SIZE), SEEK_SET) != 0 ||
+        fread(data, 1u, SMG3DS_MEM2_PAGE_SIZE,
+              g_mem2_swap_file) != SMG3DS_MEM2_PAGE_SIZE) {
+        mem2_release_page(page);
+        ++g_mem2_swap_failures;
+        return NULL;
+    }
+    g_mem2_pages_dirty[page] = false;
+    mem2_touch_page(page);
+    ++g_mem2_pages_loaded;
+    return data;
+}
+
 static void mem2_write_sparse(uint32_t offset, uint64_t value, uint8_t size)
 {
     uint8_t i;
+    const uint32_t first_page = offset >> SMG3DS_MEM2_PAGE_SHIFT;
+    const uint32_t first_in_page =
+        offset & (SMG3DS_MEM2_PAGE_SIZE - 1u);
+
+    if (size <= SMG3DS_MEM2_PAGE_SIZE - first_in_page) {
+        uint8_t* data = mem2_access_page(first_page);
+        if (data == NULL && value == 0u &&
+            g_mem2_swap_slots[first_page] == SMG3DS_MEM2_SWAP_SLOT_NONE)
+            return;
+        if (data == NULL)
+            data = mem2_allocate_page(first_page);
+        if (data == NULL)
+            return;
+        data += first_in_page;
+        if (size == 1u)
+            data[0] = (uint8_t)value;
+        else if (size == 2u)
+            write_be16(data, (uint16_t)value);
+        else if (size == 4u)
+            write_be32(data, (uint32_t)value);
+        else if (size == 8u)
+            write_be64(data, value);
+        else
+            return;
+        g_mem2_pages_dirty[first_page] = true;
+        mem2_touch_page(first_page);
+        return;
+    }
     for (i = 0; i < size; ++i) {
         const uint32_t current = offset + i;
         const uint32_t page = current >> SMG3DS_MEM2_PAGE_SHIFT;
         const uint32_t in_page = current & (SMG3DS_MEM2_PAGE_SIZE - 1u);
         const uint8_t byte =
             (uint8_t)(value >> ((size - i - 1u) * 8u));
-        if (g_mem2_pages[page] == NULL) {
-            if (byte == 0u)
+        uint8_t* data = mem2_access_page(page);
+        if (data == NULL) {
+            if (byte == 0u &&
+                g_mem2_swap_slots[page] == SMG3DS_MEM2_SWAP_SLOT_NONE)
                 continue;
-            g_mem2_pages[page] =
-                (uint8_t*)linearMemAlign(SMG3DS_MEM2_PAGE_SIZE, 0x80u);
-            if (g_mem2_pages[page] != NULL)
-                memset(g_mem2_pages[page], 0, SMG3DS_MEM2_PAGE_SIZE);
-            if (g_mem2_pages[page] == NULL) {
-                g_mem2_out_of_memory = true;
+            data = mem2_allocate_page(page);
+            if (data == NULL)
                 return;
-            }
-            ++g_mem2_pages_used;
         }
-        g_mem2_pages[page][in_page] = byte;
+        data[in_page] = byte;
+        g_mem2_pages_dirty[page] = true;
+        mem2_touch_page(page);
     }
 }
 
@@ -823,10 +3089,18 @@ static void mem2_free_sparse(void)
 {
     uint32_t page;
     for (page = 0; page < SMG3DS_MEM2_PAGE_COUNT; ++page) {
-        linearFree(g_mem2_pages[page]);
-        g_mem2_pages[page] = NULL;
+        mem2_release_page(page);
     }
     g_mem2_pages_used = 0;
+}
+
+static void mem2_swap_shutdown(void)
+{
+    if (g_mem2_swap_file != NULL) {
+        fclose(g_mem2_swap_file);
+        g_mem2_swap_file = NULL;
+        remove("sdmc:/smg3ds-mem2.swap");
+    }
 }
 
 static uint64_t mmio_shadow_read(uint32_t physical, uint8_t size)
@@ -961,6 +3235,79 @@ static bool guest_is_waiting_for_retrace(CPUState* cpu)
         return false;
     /* OSMessageQueue::queueReceive is the OSThreadQueue at offset 8. */
     return mem_read32(cpu, queue + 8u) != 0u;
+}
+
+static bool guest_async_worker_is_running(CPUState* cpu)
+{
+    u32 game_system;
+    u32 game_obj_holder;
+    u32 async_executor;
+    u32 current_thread;
+
+    if (cpu->gpr[13] == 0u)
+        return false;
+    game_system = mem_read32(cpu,
+                             cpu->gpr[13] + (u32)(s32)(-14968));
+    if (!guest_range_valid(cpu, game_system, 36u))
+        return false;
+    game_obj_holder = mem_read32(cpu, game_system + 32u);
+    if (!guest_range_valid(cpu, game_obj_holder, 44u))
+        return false;
+    async_executor = mem_read32(cpu, game_obj_holder + 40u);
+    if (!guest_range_valid(cpu, async_executor, 8u))
+        return false;
+
+    current_thread = mem_read32(cpu, 0x800000e4u);
+    for (u32 i = 0u; i < 2u; ++i) {
+        const u32 worker = mem_read32(cpu, async_executor + i * 4u);
+        const u32 thread = guest_range_valid(cpu, worker, 12u) ?
+            mem_read32(cpu, worker + 8u) : 0u;
+        if (thread != 0u && current_thread == thread)
+            return true;
+    }
+    return false;
+}
+
+static bool guest_async_work_pending(CPUState* cpu)
+{
+    u32 game_system;
+    u32 game_obj_holder;
+    u32 async_executor;
+    u32 job_count;
+
+    if (cpu->gpr[13] == 0u)
+        return false;
+    game_system = mem_read32(cpu,
+                             cpu->gpr[13] + (u32)(s32)(-14968));
+    if (!guest_range_valid(cpu, game_system, 36u))
+        return false;
+    game_obj_holder = mem_read32(cpu, game_system + 32u);
+    if (!guest_range_valid(cpu, game_obj_holder, 44u))
+        return false;
+    async_executor = mem_read32(cpu, game_obj_holder + 40u);
+    if (!guest_range_valid(cpu, async_executor, 1040u))
+        return false;
+
+    job_count = mem_read32(cpu, async_executor + 1036u);
+    if (job_count > 256u)
+        job_count = 256u;
+    for (u32 i = 0u; i < job_count; ++i) {
+        const u32 job = mem_read32(cpu, async_executor + 12u + i * 4u);
+        if (guest_range_valid(cpu, job, 13u) &&
+            mem_read8(cpu, job + 12u) == 0u)
+            return true;
+    }
+    return false;
+}
+
+static bool guest_background_thread_is_running(CPUState* cpu)
+{
+    const u32 queue = guest_retrace_queue(cpu);
+    const u32 main_waiter = queue != 0u ? mem_read32(cpu, queue + 8u) : 0u;
+    const u32 current_thread = mem_read32(cpu, 0x800000e4u);
+
+    return main_waiter != 0u && current_thread != 0u &&
+           current_thread != main_waiter;
 }
 
 
@@ -1485,15 +3832,21 @@ static void initialize_wii_low_memory(CPUState* cpu)
 int main(void)
 {
     gfxInitDefault();
-    consoleInit(GFX_BOTTOM, NULL);
     printf("\x1b[1;1HSMG3DS / Azahar bring-up\n");
     bool is_new_3ds = false;
     APT_CheckNew3DS(&is_new_3ds);
+    if (is_new_3ds)
+        osSetSpeedupEnable(true);
     printf("Hardware mode: %s\n", is_new_3ds ? "New 3DS" : "Old 3DS");
+    printf("App memory: %lu MiB, heap %lu MiB, linear %lu MiB\n",
+           (unsigned long)(osGetMemRegionSize(MEMREGION_APPLICATION) >> 20),
+           (unsigned long)(envGetHeapSize() >> 20),
+           (unsigned long)(envGetLinearHeapSize() >> 20));
     printf("DolRecomp CPU core: linked\n");
     printf("CPUState: %lu bytes\n", (unsigned long)sizeof(CPUState));
 
     CPUState cpu;
+    mem2_initialize();
     const bool mem1_ok = initialize_cpu(&cpu);
     smg3ds_exi_init();
     smg3ds_hollywood_gpio_init();
@@ -1516,7 +3869,7 @@ int main(void)
         initialize_wii_low_memory(&cpu);
         printf("big-endian memory: %s\n",
                mem_read32(&cpu, 0x80001000u) == 0x534d4733u ? "ok" : "FAILED");
-        /* MEM2 is committed in 64 KiB pages as the guest touches it. */
+        /* MEM2 is committed in 4 KiB pages as the guest touches it. */
         mem2_ok = true;
         printf("MEM2 (64 MiB): %s\n", mem2_ok ? "ok" : "unavailable");
     }
@@ -1525,10 +3878,11 @@ int main(void)
     bool dol_ok = false;
     bool disc_ok = false;
     bool running = false;
-    u32 total_dispatches = 0;
     const Result sdmc_mount = archiveMountSdmc();
-    FILE* debug_file = fopen("sdmc:/smg3ds-runtime.log", "w");
-    g_debug_file = debug_file;
+    /* Azahar may publish sdmc: before main and report "already mounted" here. */
+    const bool mem2_swap_ok = mem2_swap_open();
+    printf("MEM2 paging: %s\n", mem2_swap_ok ? "ready" : "unavailable");
+    FILE* const debug_file = NULL;
     const bool romfs_ok = mem1_ok && R_SUCCEEDED(romfsInit());
     if (romfs_ok) {
         char error[96];
@@ -1565,10 +3919,37 @@ int main(void)
                 cpu.timebase + SMG3DS_TIMEBASE_PER_FRAME;
             const u64 cpu_slice_deadline =
                 osGetTime() + SMG3DS_CPU_SLICE_MILLISECONDS;
-            if (!g_vi_demand_pacing ||
-                (guest_is_waiting_for_retrace(&cpu) &&
-                 !vi_interrupt_pending()))
+            const bool guest_waiting_for_retrace =
+                guest_is_waiting_for_retrace(&cpu);
+            if (guest_waiting_for_retrace)
+                g_vi_demand_pacing = true;
+            /*
+             * A heavyweight generated block can reach the host deadline just
+             * after the main thread enters its retrace queue but before the OS
+             * dispatcher installs the selected background thread.  Give that
+             * handoff one unsignalled host slice whenever async work is
+             * pending, then keep every background thread running until it
+             * yields.  This covers both FunctionAsyncExecutor and the loader
+             * threads it can block behind without deadlocking an idle guest.
+             */
+            const bool async_work_pending =
+                guest_async_work_pending(&cpu);
+            const bool background_running =
+                guest_waiting_for_retrace &&
+                (guest_background_thread_is_running(&cpu) ||
+                 guest_async_worker_is_running(&cpu));
+            const bool begin_background_handoff =
+                guest_waiting_for_retrace && async_work_pending &&
+                !g_vi_background_handoff_attempted;
+            if ((!g_vi_demand_pacing ||
+                 (guest_waiting_for_retrace &&
+                   !vi_interrupt_pending())) &&
+                !background_running && !begin_background_handoff) {
                 signal_video_retrace();
+                g_vi_background_handoff_attempted = false;
+            } else if (background_running || begin_background_handoff) {
+                g_vi_background_handoff_attempted = true;
+            }
             for (u32 slice = 0;
                  slice < SMG3DS_MAX_DISPATCHES_PER_FRAME && running;
                  ++slice) {
@@ -1577,7 +3958,9 @@ int main(void)
                  * at least one block per frame, then yield before another block
                  * can starve presentation, input, and runtime diagnostics.
                  */
-                if (slice != 0u && osGetTime() >= cpu_slice_deadline)
+                if (slice != 0u &&
+                    (slice & (SMG3DS_HOST_TIME_CHECK_INTERVAL - 1u)) == 0u &&
+                    osGetTime() >= cpu_slice_deadline)
                     break;
                 observe_guest_retrace_wait(&cpu);
                 service_deferred_ipc(&cpu);
@@ -1608,16 +3991,90 @@ int main(void)
                     cpu.gpr[3] = cpu.gpr[26];
                     cpu.pc = SMG3DS_FILE_RIPPER_EXISTS_CALL;
                 }
+                /*
+                 * The SDK pointer-array lookup at 0x80404a8c copies its
+                 * element count into r31 and uses it directly as CTR.  A
+                 * stale archive record can expose payload bytes as that
+                 * count; letting the generated loop run then stalls boot for
+                 * hundreds of millions of iterations.  Preserve the SDK's
+                 * ordinary "not found" result for only an impossible count.
+                 */
+                if (cpu.pc == SMG3DS_PTR_ARRAY_FIND_LOOP &&
+                    cpu.gpr[31] > 4096u) {
+                    const u32 container = cpu.gpr[30];
+                    const u32 storage = guest_range_valid(
+                        &cpu, container, 4u) ?
+                            mem_read32(&cpu, container) : 0u;
+                    const u32 stored_count = guest_range_valid(
+                        &cpu, storage, 8u) ?
+                            mem_read32(&cpu, storage + 4u) : 0u;
+                    if (!g_ptr_array_count_reported &&
+                        g_debug_file != NULL) {
+                        g_ptr_array_count_reported = true;
+                        fprintf(g_debug_file,
+                                "PTR_ARRAY_COUNT_REPAIRED count=%08lX "
+                                "container=%08lX storage=%08lX "
+                                "stored=%08lX key=%08lX lr=%08lX\n",
+                                (unsigned long)cpu.gpr[31],
+                                (unsigned long)container,
+                                (unsigned long)storage,
+                                (unsigned long)stored_count,
+                                (unsigned long)cpu.gpr[3],
+                                (unsigned long)cpu.lr);
+                        fflush(g_debug_file);
+                    }
+                    cpu.pc = SMG3DS_PTR_ARRAY_FIND_NOT_FOUND;
+                }
+                /*
+                 * ResTable::getResIndex assumes its table pointer is valid.
+                 * ResourceHolderManager can temporarily expose an entry whose
+                 * ResourceHolder is null while a layout holder with the same
+                 * archive name is being created. Address zero aliases low
+                 * guest memory here, turning its first word into a multi-
+                 * billion-iteration CTR loop. A null table has no resources,
+                 * so preserve getResIndex's normal not-found result.
+                 */
+                if (cpu.pc == SMG3DS_RESOURCE_TABLE_FIND_LOOP &&
+                    cpu.gpr[31] == 0u) {
+                    const u32 find_frame = cpu.gpr[1];
+                    const u32 table_frame = guest_range_valid(
+                        &cpu, find_frame, 4u) ?
+                            mem_read32(&cpu, find_frame) : 0u;
+                    const u32 wrapper_frame = guest_range_valid(
+                        &cpu, table_frame, 4u) ?
+                            mem_read32(&cpu, table_frame) : 0u;
+                    const u32 resource_name = guest_range_valid(
+                        &cpu, table_frame + 12u, 4u) ?
+                            mem_read32(&cpu, table_frame + 12u) : 0u;
+                    const u32 caller = guest_range_valid(
+                        &cpu, wrapper_frame + 20u, 4u) ?
+                            mem_read32(&cpu, wrapper_frame + 20u) : 0u;
+                    if (!g_resource_table_null_reported &&
+                        g_debug_file != NULL) {
+                        char resource[96];
+
+                        g_resource_table_null_reported = true;
+                        guest_copy_string(&cpu, resource_name, resource,
+                                          sizeof(resource));
+                        fprintf(g_debug_file,
+                                "RESOURCE_TABLE_NULL_NOT_FOUND "
+                                "resource=%s ptr=%08lX caller=%08lX "
+                                "frames=%08lX/%08lX/%08lX hash=%08lX\n",
+                                resource[0] != '\0' ? resource : "-",
+                                (unsigned long)resource_name,
+                                (unsigned long)caller,
+                                (unsigned long)find_frame,
+                                (unsigned long)table_frame,
+                                (unsigned long)wrapper_frame,
+                                (unsigned long)cpu.gpr[3]);
+                        fflush(g_debug_file);
+                    }
+                    cpu.pc = SMG3DS_RESOURCE_TABLE_FIND_NOT_FOUND;
+                }
                 int dispatched;
                 cpu.downcount = 0;
-                if (service_yaz0_decompression(&cpu))
-                    dispatched = 1;
-                else if (service_optional_platform_module(&cpu))
-                    dispatched = 1;
-                else if (service_coherent_cache_range(&cpu))
-                    dispatched = 1;
-                else
-                    dispatched = dolrecomp_run_blocks(&cpu, 1u);
+                dispatched = dolrecomp_run_blocks(
+                    &cpu, SMG3DS_DISPATCH_BATCH_BLOCKS);
                 advance_timebase_from_execution(&cpu);
                 bool handled_system_call = false;
                 if (cpu.exception == PPC_EXC_SYSTEM_CALL) {
@@ -1632,19 +4089,23 @@ int main(void)
                     cpu.pc = cpu.srr0;
                     handled_system_call = true;
                 }
-                if (dispatched || handled_system_call)
-                    ++total_dispatches;
                 const bool stopped =
                     (!dispatched && !handled_system_call) || cpu.exception;
                 if (stopped) {
+                    const Smg3dsDiscStats* disc = smg3ds_disc_get_stats();
                     const u32 fault_pc = cpu.exception ? cpu.srr0 : cpu.pc;
                     const u32 fault_raw =
                         g_fault_cia == fault_pc ? g_fault_raw : 0u;
-                    char fault_message[512];
                     int fault_length = snprintf(
-                        fault_message, sizeof(fault_message),
+                        g_fault_message, sizeof(g_fault_message),
                         "STOP pc=%08lX ex=%08lX srr0=%08lX srr1=%08lX "
                         "cause=%08lX lr=%08lX raw=%08lX\n"
+                        "ctr=%08lX cr=%08lX xer=%08lX sp=%08lX "
+                        "r3obj=%08lX vtbl=%08lX slot34=%08lX\n"
+                        "r24=%08lX r24a4=%08lX stage=%s/%lu "
+                        "disc=%lu/%lu/%lu last=%08llX+%lu error=%s\n"
+                        "fs=%lu info=%08lX entry=%08lX pre=%08lX/%lu/%lu "
+                        "set=%lu/%08lX post=%08lX/%lu/%lu repair=%lu\n"
                         "IPC n=%lu req=%08lX cmd=%lu ctl=%02lX flag=%08lX "
                         "mask=%08lX\n"
                         "V5 %08lX %08lX %08lX %08lX H4=%08lX\n",
@@ -1655,6 +4116,36 @@ int main(void)
                         (unsigned long)cpu.program_exception,
                         (unsigned long)cpu.lr,
                         (unsigned long)fault_raw,
+                        (unsigned long)cpu.ctr,
+                        (unsigned long)cpu.cr,
+                        (unsigned long)cpu.spr[1],
+                        (unsigned long)cpu.gpr[1],
+                        (unsigned long)cpu.gpr[3],
+                        (unsigned long)mem_read32(&cpu, cpu.gpr[3]),
+                        (unsigned long)mem_read32(
+                            &cpu, mem_read32(&cpu, cpu.gpr[3]) + 0x34u),
+                        (unsigned long)cpu.gpr[24],
+                        (unsigned long)mem_read32(&cpu, cpu.gpr[24] + 0xa4u),
+                        g_last_stage_archive,
+                        (unsigned long)g_stage_archive_requests,
+                        (unsigned long)disc->file_count,
+                        (unsigned long)disc->read_requests,
+                        (unsigned long)disc->read_failures,
+                        (unsigned long long)disc->last_offset,
+                        (unsigned long)disc->last_length,
+                        smg3ds_disc_last_error(),
+                        (unsigned long)g_file_select_receives,
+                        (unsigned long)g_file_select_request_info,
+                        (unsigned long)g_file_select_entry,
+                        (unsigned long)g_file_select_context_before,
+                        (unsigned long)g_file_select_state_before,
+                        (unsigned long)g_file_select_queue_before,
+                        (unsigned long)g_file_select_set_calls,
+                        (unsigned long)g_file_select_set_context,
+                        (unsigned long)g_file_select_context_after,
+                        (unsigned long)g_file_select_state_after,
+                        (unsigned long)g_file_select_queue_after,
+                        (unsigned long)g_file_select_wait_repairs,
                         (unsigned long)g_ipc_requests,
                         (unsigned long)g_ipc_ppc_msg,
                         (unsigned long)(g_ipc_ppc_msg != 0u ?
@@ -1668,11 +4159,11 @@ int main(void)
                         (unsigned long)mem_read32(&cpu, 0x8000050cu),
                         (unsigned long)mem_read32(&cpu, 0x80003010u));
                     if (fault_length > 0) {
-                        if (fault_length >= (int)sizeof(fault_message))
-                            fault_length = (int)sizeof(fault_message) - 1;
-                        svcOutputDebugString(fault_message, fault_length);
+                        if (fault_length >= (int)sizeof(g_fault_message))
+                            fault_length = (int)sizeof(g_fault_message) - 1;
+                        svcOutputDebugString(g_fault_message, fault_length);
                         if (debug_file != NULL) {
-                            fwrite(fault_message, 1, (size_t)fault_length,
+                            fwrite(g_fault_message, 1, (size_t)fault_length,
                                    debug_file);
                             fflush(debug_file);
                         }
@@ -1680,44 +4171,63 @@ int main(void)
                     running = false;
                 }
             }
+#if 0
             if (total_dispatches != 0u) {
                 const Smg3dsGxStats* gx = smg3ds_gx_get_stats();
                 const Smg3dsExiStats* exi = smg3ds_exi_get_stats();
                 const Smg3dsIosStats* ios = smg3ds_ios_get_stats();
-                printf("\x1b[17;1Hpc=%08lX ex=%lu blk=%lu\x1b[K",
+                if (++g_status_frames >= SMG3DS_STATUS_UPDATE_FRAMES) {
+                    g_status_frames = 0u;
+                /* Spread console traffic across frames instead of one burst. */
+                if (g_status_line == 0u)
+                    printf("\x1b[17;1Hpc=%08lX ex=%lu blk=%lu\x1b[K",
                        (unsigned long)cpu.pc, (unsigned long)cpu.exception,
                        (unsigned long)total_dispatches);
-                printf("\x1b[18;1Hmmio r=%lu w=%lu gxw=%lu size=%lu\x1b[K",
+                if (g_status_line == 1u)
+                    printf("\x1b[18;1Hmmio r=%lu w=%lu gxw=%lu size=%lu\x1b[K",
                        (unsigned long)g_mmio_reads,
                        (unsigned long)g_mmio_writes,
                        (unsigned long)g_gx_mmio_writes,
                        (unsigned long)g_last_mmio_size);
-                printf("\x1b[19;1Hread=%08lX write=%08lX\x1b[K",
+                if (g_status_line == 2u)
+                    printf("\x1b[19;1Hread=%08lX write=%08lX\x1b[K",
                        (unsigned long)g_last_mmio_read,
                        (unsigned long)g_last_mmio_write);
-                printf("\x1b[20;1Hsrr0=%08lX srr1=%08lX\x1b[K",
+                if (g_status_line == 3u)
+                    printf("\x1b[20;1Hsrr0=%08lX srr1=%08lX\x1b[K",
                        (unsigned long)cpu.srr0, (unsigned long)cpu.srr1);
-                printf("\x1b[21;1Hcause=%08lX lr=%08lX\x1b[K",
+                if (g_status_line == 4u)
+                    printf("\x1b[21;1Hcause=%08lX lr=%08lX\x1b[K",
                        (unsigned long)cpu.program_exception,
                        (unsigned long)cpu.lr);
-                printf("\x1b[22;1Hdec=%08lX msr=%08lX\x1b[K",
+                if (g_status_line == 5u)
+                    printf("\x1b[22;1Hdec=%08lX msr=%08lX\x1b[K",
                        (unsigned long)cpu.spr[22],
                        (unsigned long)cpu.msr);
-                printf("\x1b[23;1Hctl=%04lX hw=%04lX fifo=%lu\x1b[K",
+                if (g_status_line == 6u)
+                    printf("\x1b[23;1Hctl=%04lX hw=%04lX fifo=%lu\x1b[K",
                        (unsigned long)g_dsp_control,
                        (unsigned long)g_dsp_hardware_status,
                        (unsigned long)gx->fifo_bytes);
-                printf("\x1b[24;1Hgx d=%lu tri=%lu pix=%lu/%lu xfb=%lu\x1b[K",
+                if (g_status_line == 7u)
+                    printf("\x1b[24;1Hgx d=%lu tri=%lu pix=%lu/%lu xfb=%lu\x1b[K",
                        (unsigned long)gx->draw_calls,
                        (unsigned long)gx->triangles,
                        (unsigned long)gx->rasterized_pixels,
                        (unsigned long)gx->colored_pixels,
                        (unsigned long)gx->xfb_colored_pixels);
+                g_status_line = (g_status_line + 1u) %
+                                SMG3DS_STATUS_LINE_COUNT;
+                }
                 if (++g_debug_frames >= SMG3DS_DEBUG_LOG_FRAMES) {
                     const u32 run_queue_addr =
                         cpu.gpr[13] + (u32)(s32)(-8048);
                     const u32 run_queue_bits =
                         mem_read32(&cpu, run_queue_addr);
+                    const u32 run_queue_hint =
+                        mem_read32(&cpu, cpu.gpr[13] + (u32)(s32)(-8052));
+                    const u32 scheduler_disable =
+                        mem_read32(&cpu, cpu.gpr[13] + (u32)(s32)(-8056));
                     const u32 game_system = mem_read32(
                         &cpu, cpu.gpr[13] + (u32)(s32)(-14968));
                     const u32 game_spine =
@@ -1765,6 +4275,24 @@ int main(void)
                     const u32 scene_init_state =
                         guest_range_valid(&cpu, scene_controller, 180u) ?
                             mem_read32(&cpu, scene_controller + 176u) : 0u;
+                    const u32 error_watcher =
+                        guest_range_valid(&cpu, game_system, 24u) ?
+                            mem_read32(&cpu, game_system + 20u) : 0u;
+                    const u32 error_spine =
+                        guest_range_valid(&cpu, error_watcher, 36u) ?
+                            mem_read32(&cpu, error_watcher + 4u) : 0u;
+                    const u32 error_nerve =
+                        guest_range_valid(&cpu, error_spine, 16u) ?
+                            mem_read32(&cpu, error_spine + 4u) : 0u;
+                    const s32 error_drive_status =
+                        guest_range_valid(&cpu, error_watcher, 36u) ?
+                            (s32)mem_read32(&cpu, error_watcher + 24u) : 0;
+                    const u32 error_message =
+                        guest_range_valid(&cpu, error_watcher, 36u) ?
+                            mem_read32(&cpu, error_watcher + 12u) : 0u;
+                    const s32 error_wpad_status =
+                        guest_range_valid(&cpu, error_watcher, 36u) ?
+                            (s32)mem_read32(&cpu, error_watcher + 32u) : 0;
                     const u32 game_obj_holder =
                         guest_range_valid(&cpu, game_system, 36u) ?
                             mem_read32(&cpu, game_system + 32u) : 0u;
@@ -1810,12 +4338,33 @@ int main(void)
                     const u8 async_worker1_busy =
                         guest_range_valid(&cpu, async_worker1, 61u) ?
                             mem_read8(&cpu, async_worker1 + 60u) : 0u;
+                    const u32 async_thread0_queue =
+                        guest_range_valid(&cpu, async_thread0, 0x304u) ?
+                            mem_read32(&cpu, async_thread0 + 0x2dcu) : 0u;
+                    u32 async_frame =
+                        guest_range_valid(&cpu, async_thread0, 8u) ?
+                            mem_read32(&cpu, async_thread0 + 4u) : 0u;
+                    u32 async_callers[4] = {0u, 0u, 0u, 0u};
+                    for (u32 i = 0u; i < 4u; ++i) {
+                        if (!guest_range_valid(&cpu, async_frame, 8u))
+                            break;
+                        async_callers[i] = mem_read32(&cpu, async_frame + 4u);
+                        const u32 next_frame = mem_read32(&cpu, async_frame);
+                        if (next_frame == async_frame)
+                            break;
+                        async_frame = next_frame;
+                    }
                     const u32 vector_900_0 =
                         mem_read32(&cpu, 0x80000900u);
                     const u32 vector_900_1 =
                         mem_read32(&cpu, 0x80000904u);
                     const u32 current_thread =
                         mem_read32(&cpu, 0x800000e4u);
+                    const u32 current_context =
+                        mem_read32(&cpu, 0x800000d4u);
+                    const u32 current_priority =
+                        guest_range_valid(&cpu, current_thread, 0x2d4u) ?
+                            mem_read32(&cpu, current_thread + 0x2d0u) : 0xffffffffu;
                     u32 thread_ptrs[4] = {0u, 0u, 0u, 0u};
                     u32 thread_pcs[4] = {0u, 0u, 0u, 0u};
                     u32 thread_queues[4] = {0u, 0u, 0u, 0u};
@@ -1849,6 +4398,14 @@ int main(void)
                                                   active_thread + 0x2fcu);
                     }
                     g_debug_frames = 0;
+                    fprintf(g_debug_file,
+                            "ERROR_WATCHER obj=%08lX nerve=%08lX "
+                            "drive=%ld message=%08lX wpad=%ld\n",
+                            (unsigned long)error_watcher,
+                            (unsigned long)error_nerve,
+                            (long)error_drive_status,
+                            (unsigned long)error_message,
+                            (long)error_wpad_status);
                     length = snprintf(
                         message, sizeof(message),
                         "SMG3DS pc=%08lX ex=%lu blk=%lu ctl=%04lX hw=%04lX "
@@ -1859,13 +4416,16 @@ int main(void)
                         "vc=%08lX tex=%06lX/%06lX td=%lu/%lu/%lu "
                         "ts=%lux%lu>%lux%lu/%lu@%08lX "
                         "tev=%lX/%lX/%lX/%lX ttev=%lX/%lX/%lX/%lX "
-                        "mem2=%lu oom=%u "
+                        "mem2=%lu oom=%u reclaim=%lu swap=%lu/%lu/%lu/%lu "
+                        "perf=%lu/%lu/%lu/%lu "
                         "dec=%08lX dirq=%lu msr=%08lX tb=%08lX:%08lX r13=%08lX "
                         "gs=%08lX:%08lX/%08lX/%08lX/%08lX/%lu "
                         "sn=%08lX:%08lX/%08lX/%08lX/%08lX/%lu/%08lX/%lu "
-                        "ax=%08lX/%lu/%08lX/%u w=%08lX:%08lX/%04lX/%08lX/%u,%08lX:%08lX/%04lX/%08lX/%u "
-                        "rq=%08lX:%08lX v9=%08lX/%08lX last=%08lX/%08lX "
-                        "sc=%lu cache=%lu cmp=%lu yz=%lu/%lu kp=%lu/%lu/%04lX dsp=%lu dm=%08lX/%lu/%lu dt=%08lX/%08lX "
+                         "ax=%08lX/%lu/%08lX/%u w=%08lX:%08lX/%04lX/%08lX/%u,%08lX:%08lX/%04lX/%08lX/%u "
+                         "aw=%08lX/%08lX/%08lX/%08lX/%08lX "
+                        "rq=%08lX:%08lX/%08lX/%08lX ctx=%08lX/%08lX "
+                        "v9=%08lX/%08lX last=%08lX/%08lX "
+                        "sc=%lu fwr=%lu/%08lX fw=%lu/%lu/%lu/%lu/%08lX/%lu/%08lX/%08lX/%08lX:%s arp=%lu ar=%lu/%08lX/%08lX arb=%lu/%u/%lu/%lu/%08lX ah=%lu/%lu/%08lX>%08lX/%08lX/%lu/%lu ahl=%lu/%lu/%lu awr=%lu/%u cache=%lu cmp=%lu me=%lu/%08lX/%08lX yz=%lu/%lu kp=%lu/%lu/%04lX dsp=%lu dm=%08lX/%lu/%lu dt=%08lX/%08lX "
                         "lr=%08lX ctr=%08lX r31=%08lX "
                         "cur=%08lX th=%08lX:%04lX/%08lX/%08lX/"
                         "%08lX/%08lX/%08lX,"
@@ -1928,6 +4488,19 @@ int main(void)
                         (unsigned long)gx->textured_tev_alpha_env,
                         (unsigned long)g_mem2_pages_used,
                         g_mem2_out_of_memory ? 1u : 0u,
+                        (unsigned long)g_mem2_pages_reclaimed,
+                        (unsigned long)g_mem2_pages_evicted,
+                        (unsigned long)g_mem2_pages_loaded,
+                        (unsigned long)g_mem2_swap_slots_used,
+                        (unsigned long)g_mem2_swap_failures,
+                        (unsigned long)(g_cpu_slice_ticks /
+                            (SYSCLOCK_ARM11 / 1000u)),
+                        (unsigned long)(gx->raster_ticks /
+                            (SYSCLOCK_ARM11 / 1000u)),
+                        (unsigned long)(gx->efb_copy_ticks /
+                            (SYSCLOCK_ARM11 / 1000u)),
+                        (unsigned long)(gx->present_ticks /
+                            (SYSCLOCK_ARM11 / 1000u)),
                         (unsigned long)cpu.spr[22],
                         (unsigned long)g_decrementer_interrupts,
                         (unsigned long)cpu.msr,
@@ -1962,15 +4535,60 @@ int main(void)
                         (unsigned long)async_thread1_state,
                         (unsigned long)async_thread1_pc,
                         (unsigned int)async_worker1_busy,
+                        (unsigned long)async_thread0_queue,
+                        (unsigned long)async_callers[0],
+                        (unsigned long)async_callers[1],
+                        (unsigned long)async_callers[2],
+                        (unsigned long)async_callers[3],
                         (unsigned long)run_queue_addr,
                         (unsigned long)run_queue_bits,
+                        (unsigned long)run_queue_hint,
+                        (unsigned long)scheduler_disable,
+                        (unsigned long)current_context,
+                        (unsigned long)current_priority,
                         (unsigned long)vector_900_0,
                         (unsigned long)vector_900_1,
                         (unsigned long)g_last_mmio_read,
                         (unsigned long)g_last_mmio_write,
                         (unsigned long)g_system_calls,
+                        (unsigned long)g_file_holder_null_wait_retries,
+                        (unsigned long)g_file_holder_null_wait_lr,
+                        (unsigned long)g_file_wait_calls,
+                        (unsigned long)g_file_wait_ready_bypasses,
+                        (unsigned long)g_file_wait_mounted_bypasses,
+                        (unsigned long)g_file_wait_invalid_repairs,
+                        (unsigned long)g_file_wait_entry,
+                        (unsigned long)g_file_wait_state,
+                        (unsigned long)g_file_wait_context,
+                        (unsigned long)g_file_wait_lr,
+                        (unsigned long)g_file_wait_reconciled_entry,
+                        g_file_wait_path[0] != '\0' ? g_file_wait_path : "-",
+                        (unsigned long)g_archive_receive_preflight_retries,
+                        (unsigned long)g_archive_repair_submissions,
+                        (unsigned long)g_archive_repair_info,
+                        (unsigned long)g_archive_repair_file_entry,
+                        (unsigned long)g_archive_rebuild_attempts,
+                        g_archive_rebuild_pending ? 1u : 0u,
+                        (unsigned long)g_archive_rebuild_orphan_index,
+                        (unsigned long)g_archive_rebuild_file_count,
+                        (unsigned long)g_archive_rebuild_heap,
+                        (unsigned long)g_archive_holder_rebuild_attempts,
+                        (unsigned long)g_archive_holder_rebuild_state,
+                        (unsigned long)g_archive_holder_before,
+                        (unsigned long)g_archive_holder_after,
+                        (unsigned long)g_archive_holder_vector,
+                        (unsigned long)g_archive_holder_capacity,
+                        (unsigned long)g_archive_holder_count,
+                        (unsigned long)g_archive_holder_lookup_fast_paths,
+                        (unsigned long)g_archive_holder_lookup_hits,
+                        (unsigned long)g_archive_holder_invalid_entries,
+                        (unsigned long)g_archive_wait_redirects,
+                        g_archive_wait_redirect_pending ? 1u : 0u,
                         (unsigned long)g_cache_range_skips,
                         (unsigned long)g_case_compare_fast_paths,
+                        (unsigned long)g_audio_resource_skips,
+                        (unsigned long)g_audio_resource_bad_pointer,
+                        (unsigned long)g_audio_resource_bad_count,
                         (unsigned long)g_yaz0_fast_paths,
                         (unsigned long)g_yaz0_fast_bytes,
                         (unsigned long)g_kpad_reads,
@@ -2020,11 +4638,11 @@ int main(void)
                         (long)ios->last_fd,
                         (long)ios->last_result,
                         (unsigned long)ios->last_ioctl_request,
-                        (unsigned long)ios->last_bt_opcode,
-                        (unsigned long)ios->bt_events_queued,
-                        (unsigned long)ios->bt_events_delivered,
-                        (unsigned long)ios->last_bt_event_size,
-                        (unsigned long)ios->last_bt_event_word,
+                        (unsigned long)ios->last_unknown_ipc_command,
+                        (unsigned long)ios->last_unknown_fd,
+                        (unsigned long)ios->last_unknown_ioctl_request,
+                        (unsigned long)ios->di_reads,
+                        (unsigned long)ios->di_read_failures,
                         ios_path != NULL ? ios_path : "-",
                         (unsigned long)ios->invalid_requests,
                         (unsigned long)ios->unknown_requests,
@@ -2049,10 +4667,13 @@ int main(void)
                     }
                 }
             }
+#endif
             if (cpu.timebase < frame_timebase_target)
                 advance_timebase(&cpu, frame_timebase_target - cpu.timebase);
         }
 #endif
+        smg3ds_gx_present_bottom(g_host_touch.px, g_host_touch.py,
+                                 g_host_touch_active);
         if (!smg3ds_gx_present_top()) {
             gfxFlushBuffers();
             gfxSwapBuffers();
@@ -2064,7 +4685,7 @@ int main(void)
     smg3ds_disc_shutdown();
     if (debug_file != NULL)
         fclose(debug_file);
-    g_debug_file = NULL;
+    mem2_swap_shutdown();
     if (R_SUCCEEDED(sdmc_mount))
         archiveUnmount("sdmc");
     if (romfs_ok)

@@ -239,6 +239,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $azaharData 'files') -PathType Conta
 # actual covered EFB pixels—not blocks or decoded triangles—must gate success.
 $mainSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'source\main.c'))
 $gxSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'source\gx_renderer.c'))
+$discSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'source\disc.c'))
 $iosSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'source\ios_hle.c'))
 $exiSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'source\exi_hle.c'))
 $gpioSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'source\hollywood_gpio.c'))
@@ -296,10 +297,35 @@ if (-not $gxSource.Contains('rasterizer_self_test') -or
     -not $gxSource.Contains('rasterized_pixels += pixels')) {
     throw 'Renderer has no actual-pixel geometry proof'
 }
+if (-not $gxSource.Contains('static uint32_t interpolate_vertex_color') -or
+    -not $gxSource.Contains('static uint32_t apply_unlit_channel_state') -or
+    -not $gxSource.Contains('static uint32_t tev_raster_color') -or
+    -not $gxSource.Contains('static bool predecode_positions') -or
+    $gxSource -notmatch '(?s)source_color_factor\s*=\s*rgba_channel\(\*destination, channel\)' -or
+    -not $gxSource.Contains('source_color_factor_ok') -or
+    -not $gxSource.Contains('interpolated_alpha_ok') -or
+    -not $gxSource.Contains('material_alpha_ok')) {
+    throw 'Renderer lacks the UI alpha fixes or the position-only culling fast path'
+}
+if (-not $discSource.Contains('static FILE *open_cached_host_file') -or
+    -not $discSource.Contains('SMG3DS_DISC_READ_BUFFER_SIZE (64u * 1024u)') -or
+    -not $iosSource.Contains('static bool read_guest_bytes') -or
+    -not $iosSource.Contains('SMG3DS_IOS_TRANSFER_CHUNK = 64 * 1024') -or
+    -not $mainSource.Contains('SMG3DS_HOST_TIME_CHECK_INTERVAL = 8')) {
+    throw 'Incremental load/save and dispatch optimizations are missing'
+}
 if (-not $iosSource.Contains('SMG3DS_IOS_PARK') -or
     -not $iosSource.Contains('/dev/stm/eventhook') -or
     -not $iosSource.Contains('/dev/di')) {
     throw 'IOS HLE does not contain the eventhook/DI path required to reach draws'
+}
+
+# Independent alpha reference vectors cover the two regressions that made
+# almost-full-screen UI panes hide valid pixels except at their bottom edge.
+$interpolatedAlpha = [int][Math]::Round((0.0 + 255.0) / 2.0)
+$sourceColorBlend = [int][Math]::Floor((64.0 * 128.0 + 127.0) / 255.0)
+if ($interpolatedAlpha -ne 128 -or $sourceColorBlend -ne 32) {
+    throw 'UI alpha/blend reference model is invalid'
 }
 
 # Independent EXI reference vectors validate the byte order and completion
